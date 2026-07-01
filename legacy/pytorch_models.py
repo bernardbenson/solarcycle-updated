@@ -332,9 +332,222 @@ class AttentionGRUModel(nn.Module):
         return output, attn_weights
 
 
+class CausalConv1d(nn.Module):
+    """Causal convolution layer for WaveNet."""
+    
+    def __init__(self, in_channels, out_channels, kernel_size, dilation=1):
+        super().__init__()
+        self.padding = (kernel_size - 1) * dilation
+        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size, 
+                             padding=self.padding, dilation=dilation)
+        
+    def forward(self, x):
+        x = self.conv(x)
+        # Remove future information (causal)
+        return x[:, :, :-self.padding] if self.padding > 0 else x
+
+
+class WaveNetBlock(nn.Module):
+    """WaveNet residual block with dilated causal convolutions."""
+    
+    def __init__(self, residual_channels, gate_channels, skip_channels, 
+                 kernel_size=2, dilation=1, dropout=0.1):
+        super().__init__()
+        
+        self.residual_channels = residual_channels
+        self.gate_channels = gate_channels
+        self.skip_channels = skip_channels
+        
+        # Dilated causal convolution
+        self.filter_conv = CausalConv1d(residual_channels, gate_channels, 
+                                       kernel_size, dilation)
+        self.gate_conv = CausalConv1d(residual_channels, gate_channels, 
+                                     kernel_size, dilation)
+        
+        # 1x1 convolutions
+        self.residual_conv = nn.Conv1d(gate_channels, residual_channels, 1)
+        self.skip_conv = nn.Conv1d(gate_channels, skip_channels, 1)
+        
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, x):
+        # Gated activation unit
+        filter_output = torch.tanh(self.filter_conv(x))
+        gate_output = torch.sigmoid(self.gate_conv(x))
+        
+        # Element-wise multiplication (gating)
+        gated = filter_output * gate_output
+        gated = self.dropout(gated)
+        
+        # Residual connection
+        residual_output = self.residual_conv(gated)
+        if residual_output.shape == x.shape:
+            residual_output = residual_output + x
+        
+        # Skip connection
+        skip_output = self.skip_conv(gated)
+        
+        return residual_output, skip_output
+
+
+class WaveNetModel(nn.Module):
+    """
+    WaveNet model for time series forecasting.
+    Based on "WaveNet: A Generative Model for Raw Audio" adapted for solar data.
+    """
+    
+    def __init__(self, n_features=1, residual_channels=64, gate_channels=64, 
+                 skip_channels=64, n_blocks=10, n_layers_per_block=10,
+                 prediction_horizon=132, kernel_size=2, dropout=0.1):
+        super().__init__()
+        
+        self.n_features = n_features
+        self.residual_channels = residual_channels
+        self.prediction_horizon = prediction_horizon
+        
+        # Input projection
+        self.input_conv = nn.Conv1d(n_features, residual_channels, 1)
+        
+        # WaveNet blocks with exponentially increasing dilation
+        self.blocks = nn.ModuleList()
+        total_receptive_field = 1
+        
+        for block in range(n_blocks):
+            for layer in range(n_layers_per_block):
+                dilation = 2 ** layer
+                self.blocks.append(
+                    WaveNetBlock(residual_channels, gate_channels, skip_channels,
+                               kernel_size, dilation, dropout)
+                )
+                total_receptive_field += (kernel_size - 1) * dilation
+        
+        print(f"WaveNet receptive field: {total_receptive_field} time steps")
+        
+        # Output layers
+        self.output_layers = nn.Sequential(
+            nn.ReLU(),
+            nn.Conv1d(skip_channels, skip_channels, 1),
+            nn.ReLU(),
+            nn.Conv1d(skip_channels, prediction_horizon, 1)
+        )
+        
+    def forward(self, x):
+        # x shape: (batch_size, seq_len, n_features)
+        # Convert to (batch_size, n_features, seq_len) for Conv1d
+        x = x.transpose(1, 2)
+        
+        # Input projection
+        x = self.input_conv(x)
+        
+        # Accumulate skip connections
+        skip_connections = None
+        
+        # Pass through WaveNet blocks
+        for block in self.blocks:
+            x, skip = block(x)
+            
+            if skip_connections is None:
+                skip_connections = skip
+            else:
+                # Ensure shapes match for addition
+                min_len = min(skip_connections.shape[2], skip.shape[2])
+                skip_connections = skip_connections[:, :, :min_len] + skip[:, :, :min_len]
+        
+        # Output projection from skip connections
+        output = self.output_layers(skip_connections)
+        
+        # Global pooling over time dimension and reshape
+        output = output.mean(dim=2)  # (batch_size, prediction_horizon)
+        
+        return output
+
+
+class WaveNetLSTMModel(nn.Module):
+    """
+    Combined WaveNet + LSTM model as described in the paper.
+    WaveNet extracts local patterns, LSTM captures long-term dependencies.
+    """
+    
+    def __init__(self, n_features=1, wavenet_channels=64, lstm_hidden_size=128,
+                 lstm_layers=2, prediction_horizon=132, dropout=0.1):
+        super().__init__()
+        
+        self.n_features = n_features
+        self.prediction_horizon = prediction_horizon
+        
+        # WaveNet feature extractor
+        self.wavenet = WaveNetModel(
+            n_features=n_features,
+            residual_channels=wavenet_channels,
+            gate_channels=wavenet_channels,
+            skip_channels=wavenet_channels,
+            n_blocks=8,
+            n_layers_per_block=8,
+            prediction_horizon=wavenet_channels,  # Use as feature extractor
+            dropout=dropout
+        )
+        
+        # LSTM for long-term dependencies
+        self.lstm = nn.LSTM(
+            input_size=wavenet_channels,
+            hidden_size=lstm_hidden_size,
+            num_layers=lstm_layers,
+            dropout=dropout if lstm_layers > 1 else 0,
+            batch_first=True,
+            bidirectional=False
+        )
+        
+        # Output layers
+        self.output_layers = nn.Sequential(
+            nn.Linear(lstm_hidden_size, lstm_hidden_size // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(lstm_hidden_size // 2, prediction_horizon)
+        )
+        
+        # Layer normalization
+        self.layer_norm = nn.LayerNorm(wavenet_channels)
+        
+    def forward(self, x):
+        batch_size, seq_len, n_features = x.shape
+        
+        # Extract WaveNet features for each time step
+        # We'll use a sliding window approach
+        window_size = min(100, seq_len)  # Adjust based on memory constraints
+        step_size = max(1, seq_len // 50)  # Sample time steps
+        
+        wavenet_features = []
+        for i in range(0, seq_len - window_size + 1, step_size):
+            window = x[:, i:i+window_size, :]
+            # Get WaveNet output (batch_size, wavenet_channels)
+            wn_out = self.wavenet(window)
+            wavenet_features.append(wn_out.unsqueeze(1))
+        
+        # Concatenate features: (batch_size, n_windows, wavenet_channels)
+        if wavenet_features:
+            wavenet_features = torch.cat(wavenet_features, dim=1)
+        else:
+            # Fallback for short sequences
+            wavenet_features = self.wavenet(x).unsqueeze(1)
+        
+        # Layer normalization
+        wavenet_features = self.layer_norm(wavenet_features)
+        
+        # LSTM processing
+        lstm_out, (hidden, cell) = self.lstm(wavenet_features)
+        
+        # Use last hidden state for prediction
+        final_hidden = lstm_out[:, -1, :]  # (batch_size, lstm_hidden_size)
+        
+        # Output projection
+        output = self.output_layers(final_hidden)  # (batch_size, prediction_horizon)
+        
+        return output
+
+
 class EnsembleModel(nn.Module):
     """
-    Ensemble model combining Transformer, LSTM, and GRU predictions.
+    Ensemble model combining Transformer, LSTM, GRU, WaveNet, and WaveNet+LSTM predictions.
     """
     
     def __init__(self, models: List[nn.Module], weights: Optional[List[float]] = None):
@@ -352,6 +565,8 @@ class EnsembleModel(nn.Module):
         
         for model in self.models:
             if isinstance(model, SolarTransformerModel):
+                out = model(x)
+            elif isinstance(model, (WaveNetModel, WaveNetLSTMModel)):
                 out = model(x)
             else:  # LSTM or GRU models
                 out, _ = model(x)

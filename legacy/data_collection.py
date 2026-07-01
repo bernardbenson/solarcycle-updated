@@ -9,7 +9,6 @@ import requests
 from datetime import datetime, timedelta
 from typing import Tuple, Optional
 import io
-from bs4 import BeautifulSoup
 
 
 class SolarDataCollector:
