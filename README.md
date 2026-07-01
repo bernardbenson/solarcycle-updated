@@ -5,11 +5,14 @@ Advanced deep learning system for solar cycle forecasting using state-of-the-art
 ## 🚀 Key Features
 
 - **Advanced WaveNet+LSTM Architecture** with attention mechanisms and teacher forcing
+- **Exogenous Solar Precursors** — geomagnetic Ap/Kp input channels (with availability mask) plus a terminator / cycle-length conditioning signal
 - **Comprehensive Uncertainty Quantification** (MC-Dropout, Quantile Regression, Conformal Prediction)
 - **275+ years of historical data** (1749-2025, monthly observations)
 - **Robust preprocessing** with variance-stabilizing transforms and lean cycle-aware features
 - **Rolling-Origin Cross-Validation** for robust time series evaluation
 - **Peak Detection & Conformal Intervals** for solar cycle maxima prediction
+- **Stable Training** with warmup→cosine scheduling and weight EMA for smooth convergence
+- **Hindcast Backtesting** against real past cycles with per-cycle error metrics
 - **Production-Ready Pipeline** with automatic experiment tracking and plotting
 - **Apple Silicon MPS Support** for accelerated training on M1/M2 Macs
 - **Publication-Quality Visualizations** with uncertainty bands and diagnostic plots
@@ -51,15 +54,26 @@ uv run python -m solar.data.collection
 
 ### 3. Run Full Training Pipeline
 ```bash
-# Complete training with uncertainty quantification (recommended)
+# Recommended: full pipeline with exogenous precursors + uncertainty quantification.
+# Epochs/batch size come from the config (200 epochs, batch 32) — no flags needed.
+uv run python scripts/train_seq2seq.py --config solar/configs/seq2seq_precursors.yaml
+
+# Univariate quantile model (no precursors)
 uv run python scripts/train_seq2seq.py --config solar/configs/seq2seq_quantile.yaml --epochs 50 --batch-size 32
 
 # Quick test run (2 epochs)
-uv run python scripts/train_seq2seq.py --config solar/configs/seq2seq_quantile.yaml --epochs 2 --batch-size 8
+uv run python scripts/train_seq2seq.py --config solar/configs/seq2seq_precursors.yaml --epochs 2 --batch-size 8
 
 # Force CPU training (if needed)
-uv run python scripts/train_seq2seq.py --config solar/configs/seq2seq_quantile.yaml --epochs 10 --device cpu
+uv run python scripts/train_seq2seq.py --config solar/configs/seq2seq_precursors.yaml --epochs 10 --device cpu
 ```
+
+> **Note:** The precursors config feeds geomagnetic Ap/Kp as extra input channels
+> (available from 1932; pre-1932 is zero-filled and flagged by a binary mask channel)
+> and conditions the decoder on the terminator / cycle-length precursor. The model's
+> `input_dim` and `cond_dim` are derived automatically from the data config
+> (`resolve_derived_dims`), so you don't set them by hand. Precursors require the real
+> data CSV from step 2 — run `solar.data.collection` first.
 
 ### 4. Run Baseline Models for Comparison
 The trainer selects the architecture from `model.name` in the config, so the same
@@ -71,6 +85,19 @@ uv run python scripts/train_seq2seq.py --config solar/configs/ablation_tcn.yaml 
 # Standard MSE model (without quantile regression)
 uv run python scripts/train_seq2seq.py --config solar/configs/base.yaml --epochs 30
 ```
+
+### 5. Validate Against Past Cycles (hindcast backtest)
+Confirm the model tracks real solar cycles: forecast several historical cycles from
+their onset and overlay the actual outcome + MC-Dropout intervals. Loads the latest
+trained run (no retraining) and prints per-cycle RMSE / peak-timing / peak-magnitude
+errors:
+```bash
+uv run python scripts/backtest.py --config solar/configs/seq2seq_precursors.yaml --n-panels 4
+# --run <dir>     pick a specific experiment (default: most recent)
+# --raw-units     report errors in raw sunspot number instead of scaled units
+```
+Each training run also writes a `next_cycle_forecast.png` (a genuine forward forecast
+from the latest data) and a `cycle_backtest.png` into its `plots/` directory.
 
 ## 🏗️ Architecture Overview
 
@@ -91,8 +118,26 @@ The core architecture combines three powerful components:
 
 3. **Attention Decoder with Teacher Forcing**
    - LSTM decoder with scaled dot-product attention
-   - Teacher forcing ratio: 0.6 → 0.1 (with decay)
+   - Teacher forcing ratio: 0.6 → 0.1 (with decay); precursors config runs free-running (0.0)
    - Generates 132-month predictions (11-year solar cycle)
+
+### Exogenous Precursors & Conditioning
+
+Beyond the sunspot channel, the model can ingest physically-motivated precursors:
+
+- **Geomagnetic input channels** — `ap_avg` / `kp_sum` are concatenated as extra
+  input channels. They exist only from 1932, so pre-1932 months are zero-filled and
+  flagged by a **binary availability-mask channel** the model learns to gate on.
+- **Terminator / cycle-length conditioning** — the length of the most recently
+  completed cycle (minimum-to-minimum) is step-held per month and fed as a decoder
+  conditioning vector (`cond_dim`). Cycle length anti-correlates with the amplitude of
+  the *following* cycle — a robust, sunspot-derivable proxy for the Hale-cycle
+  "terminator separation" of McIntosh et al. (2023). Minima are detected with the same
+  routine the hindcast backtest uses, so the two stay consistent.
+
+Channel counts (`input_dim`, `cond_dim`) are derived from the data config by
+`resolve_derived_dims`; an empty `precursor_cols` keeps the model fully univariate
+(backward compatible).
 
 ### Prediction Heads
 
@@ -128,17 +173,24 @@ data/experiments/run_seq2seq_quantile_20251029_162852_c346a904/
 
 ### Available Configurations
 
-1. **`seq2seq_quantile.yaml`** - **Recommended**: Full uncertainty quantification
+1. **`seq2seq_precursors.yaml`** - **Recommended**: Full pipeline with exogenous precursors
+   - Geomagnetic Ap/Kp input channels + availability mask
+   - Terminator / cycle-length decoder conditioning
+   - Quantile regression, warmup→cosine schedule, weight EMA, rolling-origin CV
+   - `start_year: 1818` (retains full sunspot history; pre-1932 geomagnetic masked)
+   - Requires the real data CSV (`solar.data.collection`)
+
+2. **`seq2seq_quantile.yaml`** - Univariate uncertainty quantification
    - Quantile regression with pinball loss
    - 200 epochs, teacher forcing with decay
    - Robust scaling with sqrt transform
 
-2. **`base.yaml`** - Standard MSE model
+3. **`base.yaml`** - Standard MSE model
    - Point predictions only
    - 100 epochs, cosine learning rate schedule
    - Good baseline for comparison
 
-3. **`ablation_tcn.yaml`** - TCN-only baseline
+4. **`ablation_tcn.yaml`** - TCN-only baseline
    - Temporal Convolutional Network without LSTM
    - 150 epochs, simpler architecture
    - For ablation studies
@@ -334,13 +386,16 @@ solarcycle-updated/
 │   │   ├── normalization.py        # Robust scaling / variance-stabilizing transforms
 │   │   ├── plotting.py             # Visualization utilities
 │   │   ├── rolling_cv.py           # Rolling-origin cross-validation
+│   │   ├── precursors.py           # Terminator / cycle-length precursor + minima detection
 │   │   └── peak_metrics.py         # Peak detection + conformal intervals
 │   └── configs/                    # Model configurations
-│       ├── seq2seq_quantile.yaml   # Recommended config
+│       ├── seq2seq_precursors.yaml # Recommended: precursors + conditioning
+│       ├── seq2seq_quantile.yaml   # Univariate quantile config
 │       ├── base.yaml               # Standard MSE config
 │       └── ablation_tcn.yaml       # TCN baseline
 ├── scripts/
-│   └── train_seq2seq.py            # Main training entry point
+│   ├── train_seq2seq.py            # Main training entry point
+│   └── backtest.py                 # Hindcast backtest against real past cycles
 ├── tests/
 │   └── test_device_compatibility.py
 ├── legacy/                         # Superseded first-generation scripts (kept for reference)
@@ -369,6 +424,7 @@ The implementation builds on several key methodologies:
 - **Teacher Forcing**: Williams & Zipser (1989) - Sequence-to-sequence training
 - **Quantile Regression**: Koenker & Bassett (1978) - Probabilistic predictions
 - **Conformal Prediction**: Vovk et al. (2005) - Calibrated prediction intervals
+- **Terminator / Hale-cycle precursors**: McIntosh et al. (2023) - Cycle-length terminator separation as an amplitude precursor
 
 ## 🏆 Citation
 

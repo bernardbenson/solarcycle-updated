@@ -323,8 +323,8 @@ class NBEATSx(nn.Module):
             if isinstance(module, nn.Dropout):
                 module.train()
     
-    def mc_predict(self, x: torch.Tensor, n_samples: int = 30) -> torch.Tensor:
-        """Generate MC-Dropout predictions."""
+    def mc_predict(self, x: torch.Tensor, cond=None, n_samples: int = 30) -> torch.Tensor:
+        """Generate MC-Dropout predictions (cond accepted for a uniform interface, unused)."""
         self.eval()
         self.enable_mc_dropout()
         

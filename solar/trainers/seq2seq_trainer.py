@@ -21,54 +21,50 @@ from ..models.nbeatsx import NBEATSx
 from ..models.heads import pinball_loss, quantile_loss_with_coverage, compute_combined_loss
 from ..utils.rolling_cv import RollingOriginCV, BlockedTimeSeriesCV, TimeSeriesMetrics
 from ..utils.peak_metrics import PeakMetrics, ConformalPeakPredictor
-from ..utils.normalization import RobustScaler, prepare_enhanced_monthly_data
+from ..utils.normalization import (
+    RobustScaler, MultiChannelScaler, prepare_multivariate_monthly_data,
+)
+from ..utils.precursors import detect_cycle_minima, cycle_length_series
 from ..utils.config import ExperimentConfig
 from ..utils.plotting import SolarCyclePlotter
 
 
 class SolarSequenceDataset(Dataset):
-    """Dataset for sliding window sequence-to-sequence prediction."""
-    
-    def __init__(self, data: np.ndarray, features: Optional[Dict[str, np.ndarray]] = None,
+    """Sliding-window dataset emitting ``(input, target, cond)``.
+
+    ``data`` is the scaled series: 1-D ``(T,)`` (univariate) or 2-D ``(T, C)``
+    (multivariate, channel 0 = target). The input is the window of all channels; the
+    target is the following horizon of channel 0 only. ``cond`` is the per-window
+    precursor conditioning vector (empty when conditioning is disabled).
+    """
+
+    def __init__(self, data: np.ndarray, cond: Optional[np.ndarray] = None,
                  input_window: int = 528, output_window: int = 132, step: int = 1):
-        self.data = data
-        self.features = features
-        self.input_window = input_window
-        self.output_window = output_window
-        self.step = step
-        
-        # Create sequences
-        self.sequences = []
-        self.targets = []
-        self.feature_sequences = []
-        
+        data = np.asarray(data, dtype=np.float32)
+        multivariate = data.ndim == 2
+        cond_dim = 0 if cond is None else 1
+
+        self.sequences, self.targets, self.conds = [], [], []
         for i in range(0, len(data) - input_window - output_window + 1, step):
-            # Input sequence
-            input_seq = data[i:i + input_window]
-            
-            # Target sequence
-            target_seq = data[i + input_window:i + input_window + output_window]
-            
-            self.sequences.append(torch.FloatTensor(input_seq).unsqueeze(-1))
-            self.targets.append(torch.FloatTensor(target_seq))
-            
-            # Feature sequences if available
-            if features:
-                feat_seq = {}
-                for feat_name, feat_data in features.items():
-                    feat_seq[feat_name] = torch.FloatTensor(
-                        feat_data[i:i + input_window]
-                    )
-                self.feature_sequences.append(feat_seq)
-    
+            window = data[i:i + input_window]
+            input_seq = torch.from_numpy(window if multivariate else window[:, None])
+
+            target_end = i + input_window + output_window
+            target_col = data[i + input_window:target_end]
+            target_seq = torch.from_numpy(target_col[:, 0] if multivariate else target_col)
+
+            self.sequences.append(input_seq)
+            self.targets.append(target_seq)
+            if cond_dim:
+                self.conds.append(torch.tensor([cond[i + input_window - 1]], dtype=torch.float32))
+            else:
+                self.conds.append(torch.zeros(0, dtype=torch.float32))
+
     def __len__(self):
         return len(self.sequences)
-    
+
     def __getitem__(self, idx):
-        if self.features:
-            return self.sequences[idx], self.targets[idx], self.feature_sequences[idx]
-        else:
-            return self.sequences[idx], self.targets[idx]
+        return self.sequences[idx], self.targets[idx], self.conds[idx]
 
 
 class Seq2SeqTrainer(CombinedTrainerMixin):
@@ -101,7 +97,10 @@ class Seq2SeqTrainer(CombinedTrainerMixin):
         
         # Initialize components
         self.model = None
-        self.data_scaler = None
+        self.data_scaler = None          # target (sunspot) scaler; used for inverse-transform
+        self.multi_scaler = None         # per-channel input scaler (multivariate runs only)
+        self.cond_scaler = None          # normaliser for the terminator conditioning scalar
+        self._train_df = None            # df used for training (for plot rebuilding)
         self.peak_detector = PeakMetrics()
         self.conformal_predictor = ConformalPeakPredictor()
         
@@ -116,55 +115,71 @@ class Seq2SeqTrainer(CombinedTrainerMixin):
             torch.cuda.manual_seed(seed)
             torch.cuda.manual_seed_all(seed)
     
-    def prepare_data(self, df, use_features: bool = True) -> Tuple[np.ndarray, Dict[str, np.ndarray], RobustScaler]:
-        """Prepare data with enhanced normalization and features."""
-        # Convert enum values to strings if needed
+    def _scaler_config(self) -> Dict[str, Any]:
+        """Normalization settings for the target channel (accept str or enum)."""
         method = self.config.data.normalization.method
         transform = self.config.data.normalization.transform
-        
-        if hasattr(method, 'value'):
-            method = method.value
-        if hasattr(transform, 'value'):
-            transform = transform.value
-            
-        scaler_config = {
-            'method': method,
-            'transform': transform,
-            'quantile_range': self.config.data.normalization.quantile_range
+        return {
+            'method': getattr(method, 'value', method),
+            'transform': getattr(transform, 'value', transform),
+            'quantile_range': self.config.data.normalization.quantile_range,
         }
-        
-        if use_features and self.config.data.add_features:
-            try:
-                scaled_target, features, scaler = prepare_enhanced_monthly_data(
-                    df, 
-                    target_col=self.config.data.target_col,
-                    start_year=self.config.data.start_year,
-                    scaler_config=scaler_config
-                )
-            except Exception as e:
-                print(f"Warning: Feature preparation failed ({e}), using simple preparation")
-                use_features = False
-        
-        if not use_features or not self.config.data.add_features:
-            # Simple preparation without features
-            import pandas as pd
-            df['date'] = pd.to_datetime(df['date'])
-            df = df.set_index('date')
-            df = df[df.index.year >= self.config.data.start_year]
-            
-            monthly_data = df[self.config.data.target_col].resample('ME').mean().dropna()
-            
-            scaler = RobustScaler(**scaler_config)
-            scaled_target = scaler.fit_transform(monthly_data.values)
-            features = {}
-        
-        return scaled_target, features, scaler
-    
-    def create_data_loaders(self, data: np.ndarray, features: Optional[Dict[str, np.ndarray]] = None,
+
+    def prepare_data(self, df) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        """Prepare scaled model inputs and optional precursor conditioning.
+
+        Returns ``(scaled_input, cond_series)``: ``scaled_input`` is ``(T,)`` univariate
+        or ``(T, C)`` multivariate (channel 0 = target); ``cond_series`` is a normalized
+        ``(T,)`` terminator series or None. Sets ``self.data_scaler`` (target),
+        ``self.multi_scaler`` and ``self.cond_scaler``.
+        """
+        import pandas as pd
+        scaler_config = self._scaler_config()
+        precursor_cols = list(self.config.data.precursor_cols)
+
+        if precursor_cols:
+            X_scaled, X_raw, multi_scaler, _dates = prepare_multivariate_monthly_data(
+                df,
+                target_col=self.config.data.target_col,
+                precursor_cols=precursor_cols,
+                geomag_mask=self.config.data.geomag_mask,
+                start_year=self.config.data.start_year,
+                scaler_config=scaler_config,
+            )
+            self.multi_scaler = multi_scaler
+            self.data_scaler = multi_scaler.target_scaler
+            scaled_input = X_scaled
+            raw_target = X_raw[:, 0]
+        else:
+            d = df.copy()
+            d['date'] = pd.to_datetime(d['date'])
+            d = d.set_index('date')
+            d = d[d.index.year >= self.config.data.start_year]
+            monthly = d[self.config.data.target_col].resample('ME').mean().dropna()
+            self.data_scaler = RobustScaler(**scaler_config)
+            scaled_input = self.data_scaler.fit_transform(monthly.values)
+            self.multi_scaler = None
+            raw_target = monthly.values
+
+        cond_series = None
+        self.cond_scaler = None
+        if self.config.data.use_terminator:
+            cond_raw = cycle_length_series(raw_target, self.config.data.prediction_horizon)
+            train_end = max(1, int(len(cond_raw) * (1.0 - self.config.training.val_ratio)))
+            self.cond_scaler = RobustScaler(method='standard', transform='identity')
+            self.cond_scaler.fit(cond_raw[:train_end])
+            if self.cond_scaler.scaler is not None and hasattr(self.cond_scaler.scaler, 'scale_'):
+                # Guard against a degenerate (constant) training slice.
+                self.cond_scaler.scaler.scale_ = np.maximum(self.cond_scaler.scaler.scale_, 1e-6)
+            cond_series = self.cond_scaler.transform(cond_raw.reshape(-1, 1)).ravel()
+
+        return scaled_input, cond_series
+
+    def create_data_loaders(self, data: np.ndarray, cond: Optional[np.ndarray] = None,
                            train_ratio: float = 0.8) -> Tuple[DataLoader, DataLoader]:
         """Create train and validation data loaders."""
         dataset = SolarSequenceDataset(
-            data, features,
+            data, cond,
             input_window=self.config.data.input_window,
             output_window=self.config.data.prediction_horizon,
             step=1
@@ -266,7 +281,13 @@ class Seq2SeqTrainer(CombinedTrainerMixin):
         
         return loss, loss_components
     
-    def train_epoch(self, model: nn.Module, train_loader: DataLoader, 
+    def _batch_cond(self, cond: torch.Tensor) -> Optional[torch.Tensor]:
+        """Move a batch's conditioning tensor to device, or None when disabled."""
+        if cond is None or cond.shape[-1] == 0:
+            return None
+        return cond.to(self.device)
+
+    def train_epoch(self, model: nn.Module, train_loader: DataLoader,
                    optimizer: torch.optim.Optimizer, epoch: int) -> Dict[str, float]:
         """Train for one epoch."""
         model.train()
@@ -280,30 +301,29 @@ class Seq2SeqTrainer(CombinedTrainerMixin):
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
         
         for batch_idx, batch in enumerate(progress_bar):
-            if len(batch) == 3:
-                inputs, targets, features = batch
-            else:
-                inputs, targets = batch
-                features = None
-            
+            inputs, targets, cond = batch
             inputs = inputs.to(self.device)
             targets = targets.to(self.device)
-            
+            cond = self._batch_cond(cond)
+
             optimizer.zero_grad()
-            
-            # Forward pass with autocast. targets/teacher_forcing_ratio are passed by
+
+            # Forward pass with autocast. cond/targets/teacher_forcing_ratio are passed by
             # keyword so feed-forward models (TCN, N-BEATS) can ignore them via **kwargs.
             with self.autocast_context():
-                outputs = model(inputs, targets=targets, teacher_forcing_ratio=tf_ratio)
+                outputs = model(inputs, cond=cond, targets=targets, teacher_forcing_ratio=tf_ratio)
                 loss, loss_components = self.compute_loss(outputs, targets)
-            
+
             # Backward pass with gradient scaling
             self.scale_and_step(
-                loss, optimizer, 
+                loss, optimizer,
                 clip_grad_norm=self.config.training.grad_clip_norm,
                 model=model
             )
-            
+
+            # Update the EMA shadow weights after each optimizer step.
+            self.update_ema(model)
+
             # Track losses
             epoch_losses.append(loss.item())
             for key, value in loss_components.items():
@@ -335,18 +355,14 @@ class Seq2SeqTrainer(CombinedTrainerMixin):
         
         with torch.no_grad():
             for batch in val_loader:
-                if len(batch) == 3:
-                    inputs, targets, features = batch
-                else:
-                    inputs, targets = batch
-                    features = None
-                
+                inputs, targets, cond = batch
                 inputs = inputs.to(self.device)
                 targets = targets.to(self.device)
-                
+                cond = self._batch_cond(cond)
+
                 # Forward pass without teacher forcing
                 with self.autocast_context():
-                    outputs = model(inputs, teacher_forcing_ratio=0.0)
+                    outputs = model(inputs, cond=cond, teacher_forcing_ratio=0.0)
                     loss, loss_components = self.compute_loss(outputs, targets)
                 
                 val_losses.append(loss.item())
@@ -391,25 +407,35 @@ class Seq2SeqTrainer(CombinedTrainerMixin):
         
         # Prepare data
         print("Preparing data...")
-        scaled_data, features, scaler = self.prepare_data(df, use_features=self.config.data.add_features)
-        self.data_scaler = scaler
-        
-        print(f"Data shape: {scaled_data.shape}")
-        print(f"Features: {list(features.keys()) if features else 'None'}")
-        
-        # Save scaler
+        self._train_df = df
+        scaled_data, cond_series = self.prepare_data(df)
+
+        # Keep model input/cond dims consistent with the assembled channels.
+        self.config.model.input_dim = scaled_data.shape[1] if scaled_data.ndim == 2 else 1
+        self.config.model.cond_dim = 1 if self.config.data.use_terminator else 0
+
+        print(f"Data shape: {scaled_data.shape}, input_dim={self.config.model.input_dim}, "
+              f"cond_dim={self.config.model.cond_dim}")
+
+        # Save scalers (target scaler.json is unchanged; extras only when multivariate/conditioned).
         self.data_scaler.save_params(output_dir / "scaler.json")
-        
-        # Create model
+        if self.multi_scaler is not None:
+            self.multi_scaler.save_params(output_dir / "feature_scalers.json")
+        if self.cond_scaler is not None:
+            self.cond_scaler.save_params(output_dir / "cond_scaler.json")
+
+        # Create model + EMA
         print("Creating model...")
         model = self.create_model()
         self.model = model
-        
+        self.init_ema(model, decay=self.config.training.ema_decay,
+                      enabled=self.config.training.use_ema)
+
         print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
-        
+
         # Create data loaders
         train_loader, val_loader = self.create_data_loaders(
-            scaled_data, features, train_ratio=1.0 - self.config.training.val_ratio
+            scaled_data, cond_series, train_ratio=1.0 - self.config.training.val_ratio
         )
         
         print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
@@ -417,10 +443,11 @@ class Seq2SeqTrainer(CombinedTrainerMixin):
         # Create optimizer and scheduler
         optimizer = self.create_optimizer(model)
         scheduler = self.create_scheduler(
-            optimizer, 
+            optimizer,
             self.config.training.scheduler,
             {
                 'warmup_epochs': self.config.training.warmup_epochs,
+                'total_epochs': self.config.training.epochs,
                 'patience': self.config.training.scheduler_patience,
                 'factor': self.config.training.scheduler_factor
             }
@@ -434,10 +461,15 @@ class Seq2SeqTrainer(CombinedTrainerMixin):
         for epoch in range(self.config.training.epochs):
             # Train epoch
             train_metrics = self.train_epoch(model, train_loader, optimizer, epoch)
-            
+
+            # Evaluate / select / checkpoint using the EMA weights when enabled; the raw
+            # weights are swapped back after the epoch (unless early stopping restores the
+            # EMA-best weights into the model, in which case we keep them).
+            ema_backup = self.copy_to(model) if self.ema_enabled else None
+
             # Validation epoch
             val_metrics = self.validate_epoch(model, val_loader)
-            
+
             # Combine metrics
             epoch_metrics = {**train_metrics, **val_metrics}
             
@@ -470,7 +502,7 @@ class Seq2SeqTrainer(CombinedTrainerMixin):
                       f"LR: {current_lr:.2e}, "
                       f"TF: {train_metrics['teacher_forcing_ratio']:.3f}")
             
-            # Save best model
+            # Save best model (EMA weights when enabled).
             if val_metrics['val_loss'] < best_val_loss:
                 best_val_loss = val_metrics['val_loss']
                 if self.config.save_model:
@@ -478,7 +510,12 @@ class Seq2SeqTrainer(CombinedTrainerMixin):
                         model, optimizer, scheduler, epoch, val_metrics['val_loss'],
                         output_dir / "best_model.pt"
                     )
-            
+
+            # Swap raw weights back for the next epoch's training (skip on stop so the
+            # EMA-best weights restored by early stopping are preserved).
+            if ema_backup is not None and not should_stop:
+                self.restore(model, ema_backup)
+
             if should_stop:
                 print(f"Early stopping at epoch {epoch+1}")
                 break
@@ -486,13 +523,18 @@ class Seq2SeqTrainer(CombinedTrainerMixin):
         # Save training metrics
         self.save_metrics(output_dir / "training_metrics.json")
         
-        # Save final model
+        # Save final model (last-epoch weights)
         if self.config.save_model:
             self.save_checkpoint(
                 model, optimizer, scheduler, epoch, val_metrics['val_loss'],
                 output_dir / "final_model.pt"
             )
-        
+
+        # Load the best (early-stopping-tracked) weights so plots use the best model.
+        if getattr(self, 'best_weights', None) is not None:
+            device = next(model.parameters()).device
+            model.load_state_dict({k: v.to(device) for k, v in self.best_weights.items()})
+
         # Training results
         training_results = {
             'best_epoch': self.get_best_epoch('val_loss'),
@@ -506,111 +548,208 @@ class Seq2SeqTrainer(CombinedTrainerMixin):
         # Generate plots if enabled
         if self.config.plot_training or self.config.plot_predictions:
             print("Generating plots...")
-            self._generate_plots(output_dir, training_results, scaled_data, features)
-        
+            self._generate_plots(output_dir, training_results)
+
         return training_results
     
-    def _generate_plots(self, output_dir: Path, training_results: Dict[str, Any], 
-                       scaled_data: np.ndarray, features: Dict[str, np.ndarray]):
+    def _generate_plots(self, output_dir: Path, training_results: Dict[str, Any]):
         """Generate comprehensive plots after training."""
-        # Create plots subdirectory
         plots_dir = output_dir / "plots"
         plots_dir.mkdir(exist_ok=True)
-        
+
         plotter = SolarCyclePlotter(style='publication')
-        
+        name = self.config.experiment_name
+
         try:
             # 1. Training history plot
             if hasattr(self, 'metrics_history') and self.config.plot_training:
                 print("  - Generating training history plot...")
                 fig = plotter.plot_training_history_enhanced(
-                    self.metrics_history,
-                    save_path=plots_dir / "training_history.png"
+                    self.metrics_history, save_path=plots_dir / "training_history.png"
                 )
                 plt.close(fig)
-            
-            # 2. Generate sample predictions with uncertainty
-            if self.config.plot_predictions and self.model is not None:
-                print("  - Generating prediction plots with uncertainty...")
-                
-                # Generate predictions on recent data
-                recent_window = min(self.config.data.input_window, len(scaled_data) - 50)
-                test_input = scaled_data[-recent_window-50:-50]
-                
-                # Get uncertainty predictions
-                uncertainty_results = self.predict_with_uncertainty(
-                    test_input, n_mc_samples=20
-                )
-                
-                # Plot predictions with uncertainty
-                prediction_data = {
-                    'prediction': uncertainty_results['mean'],
-                    'uncertainty': {
-                        'q10': uncertainty_results['q10'],
-                        'q50': uncertainty_results['q50'], 
-                        'q90': uncertainty_results['q90']
-                    }
-                }
-                
-                # Get actual data for comparison if available
-                actual_data = scaled_data[-50:] if len(scaled_data) >= 50 else None
-                if actual_data is not None and self.data_scaler is not None:
-                    actual_data = self.data_scaler.inverse_transform(actual_data.reshape(-1, 1)).ravel()
-                
+
+            if not (self.config.plot_predictions and self.model is not None):
+                print(f"  ✅ Plots saved to: {plots_dir}")
+                return
+
+            raw_target, X_raw, cond_raw, dates = self._monthly_arrays(self._train_df)
+            window = self.config.data.input_window
+            n = len(raw_target)
+
+            # 2-4. Recent predictions (anchored 50 months before the end for overlap).
+            if n - 50 - window >= 0:
+                print("  - Generating recent predictions + uncertainty plots...")
+                unc = self._forecast_from(raw_target, X_raw, cond_raw, n - 50, n_mc=20)
+                actual = raw_target[-50:]
                 fig = plotter.plot_single_cycle_with_uncertainty(
-                    actual=actual_data,
-                    prediction=uncertainty_results['mean'],
-                    uncertainty=prediction_data['uncertainty'],
-                    title=f"Recent Predictions - {self.config.experiment_name}",
-                    xlabel="Time Steps",
-                    ylabel="Sunspot Number",
-                    save_path=plots_dir / "recent_predictions_with_uncertainty.png"
-                )
+                    actual=actual, prediction=unc['mean'],
+                    uncertainty={'q10': unc['q10'], 'q50': unc['q50'], 'q90': unc['q90']},
+                    title=f"Recent Predictions - {name}", xlabel="Months", ylabel="Sunspot Number",
+                    save_path=plots_dir / "recent_predictions_with_uncertainty.png")
                 plt.close(fig)
-                
-                # 3. MC-Dropout uncertainty plot
-                print("  - Generating MC-dropout uncertainty plot...")
                 fig = plotter.plot_mc_dropout_uncertainty(
-                    mc_samples=uncertainty_results['samples'],
-                    actual=actual_data,
-                    title=f"MC-Dropout Uncertainty - {self.config.experiment_name}",
-                    save_path=plots_dir / "mc_dropout_uncertainty.png"
-                )
+                    mc_samples=unc['samples'], actual=actual,
+                    title=f"MC-Dropout Uncertainty - {name}",
+                    save_path=plots_dir / "mc_dropout_uncertainty.png")
                 plt.close(fig)
-                
-                # 4. Peak distribution plot
-                print("  - Generating peak distribution plot...")
                 fig = plotter.plot_peak_distribution(
-                    prediction_samples=uncertainty_results['samples'].T,  # Transpose for correct shape
-                    title=f"Peak Distribution - {self.config.experiment_name}",
-                    save_path=plots_dir / "peak_distribution.png"
-                )
+                    prediction_samples=unc['samples'].T,
+                    title=f"Peak Distribution - {name}",
+                    save_path=plots_dir / "peak_distribution.png")
                 plt.close(fig)
-                
+
+            # 5. Genuine next-cycle forecast anchored on the most recent window.
+            if n >= window:
+                print("  - Generating next-cycle forecast...")
+                fc = self._forecast_from(raw_target, X_raw, cond_raw, n,
+                                         n_mc=self.config.model.mc_dropout_samples)
+                fig = plotter.plot_forecast_continuation(
+                    history=raw_target, forecast_mean=fc['mean'],
+                    forecast_lower=fc['q10'], forecast_upper=fc['q90'],
+                    title=f"Next Solar Cycle Forecast - {name}",
+                    save_path=plots_dir / "next_cycle_forecast.png")
+                plt.close(fig)
+
         except Exception as e:
+            import traceback
             print(f"Warning: Plot generation failed with error: {e}")
+            traceback.print_exc()
             print("Continuing without plots...")
-        
+
         print(f"  ✅ Plots saved to: {plots_dir}")
     
-    def predict_with_uncertainty(self, input_data: np.ndarray, 
+    def load_trained(self, run_dir: Union[str, Path]) -> 'Seq2SeqTrainer':
+        """Load a previously trained model + scaler from an experiment directory."""
+        run_dir = Path(run_dir)
+        model = self.create_model()
+        ckpt_path = run_dir / "best_model.pt"
+        if not ckpt_path.exists():
+            ckpt_path = run_dir / "final_model.pt"
+        checkpoint = torch.load(ckpt_path, map_location=self.device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model.eval()
+        self.model = model
+
+        self.data_scaler = RobustScaler.load_params(run_dir / "scaler.json")
+        feature_scalers = run_dir / "feature_scalers.json"
+        if feature_scalers.exists():
+            self.multi_scaler = MultiChannelScaler.load_params(feature_scalers)
+            self.data_scaler = self.multi_scaler.target_scaler
+        cond_scaler = run_dir / "cond_scaler.json"
+        if cond_scaler.exists():
+            self.cond_scaler = RobustScaler.load_params(cond_scaler)
+        return self
+
+    def _monthly_series(self, df) -> Tuple[np.ndarray, 'Any']:
+        """Return the raw monthly target series and its DatetimeIndex."""
+        import pandas as pd
+        d = df.copy()
+        d['date'] = pd.to_datetime(d['date'])
+        d = d.set_index('date')
+        d = d[d.index.year >= self.config.data.start_year]
+        monthly = d[self.config.data.target_col].resample('ME').mean().dropna()
+        return monthly.values.astype(float), monthly.index
+
+    def _monthly_arrays(self, df):
+        """Return ``(raw_target (T,), X_raw (T,C) or None, cond_raw (T,) or None, dates)``.
+
+        Rebuilds the raw monthly arrays (target, precursor channels, conditioning) for
+        plotting/backtesting without needing prior state — works after load_trained().
+        """
+        precursor_cols = list(self.config.data.precursor_cols)
+        if precursor_cols:
+            _, X_raw, _, dates = prepare_multivariate_monthly_data(
+                df, target_col=self.config.data.target_col,
+                precursor_cols=precursor_cols, geomag_mask=self.config.data.geomag_mask,
+                start_year=self.config.data.start_year, scaler_config=self._scaler_config())
+            raw_target = X_raw[:, 0]
+        else:
+            raw_target, dates = self._monthly_series(df)
+            X_raw = None
+        cond_raw = (cycle_length_series(raw_target, self.config.data.prediction_horizon)
+                    if self.config.data.use_terminator else None)
+        return raw_target, X_raw, cond_raw, dates
+
+    def _forecast_from(self, raw_target, X_raw, cond_raw, end_idx: int,
+                       n_mc: int) -> Dict[str, np.ndarray]:
+        """Forecast the horizon starting at ``end_idx`` from the preceding window."""
+        window = self.config.data.input_window
+        start = end_idx - window
+        input_data = X_raw[start:end_idx] if X_raw is not None else raw_target[start:end_idx]
+        cond = cond_raw[end_idx - 1] if cond_raw is not None else None
+        return self.predict_with_uncertainty(input_data, cond=cond, n_mc_samples=n_mc)
+
+    def backtest_cycles(self, df, n_panels: int = 4,
+                        history_months: int = 660) -> List[Dict[str, Any]]:
+        """Hindcast past solar cycles for validation.
+
+        Detects recent cycle minima, and for each one forecasts the following
+        horizon from history ending at that minimum, pairing the forecast (with
+        MC-Dropout interval) against the actual observed cycle.
+        """
+        if self.model is None or self.data_scaler is None:
+            raise ValueError("No trained model. Call train() or load_trained() first.")
+
+        raw, X_raw, cond_raw, dates = self._monthly_arrays(df)
+        window = self.config.data.input_window
+        horizon = self.config.data.prediction_horizon
+
+        # Cycle minima as forecast origins (shared with the terminator precursor logic).
+        troughs = detect_cycle_minima(raw, horizon)
+        origins = [t for t in troughs if t >= window and t + horizon <= len(raw)]
+        origins = origins[-n_panels:]
+        if not origins:
+            raise ValueError("Not enough data to build backtest panels.")
+
+        panels = []
+        for origin in origins:
+            forecast = self._forecast_from(raw, X_raw, cond_raw, origin,
+                                           n_mc=self.config.model.mc_dropout_samples)
+            start = max(0, origin - history_months)
+            panels.append({
+                'history_dates': dates[start:origin],
+                'history_values': raw[start:origin],
+                'forecast_dates': dates[origin:origin + horizon],
+                'pred_mean': forecast['mean'],
+                'pred_lower': forecast['q10'],
+                'pred_upper': forecast['q90'],
+                'actual': raw[origin:origin + horizon],
+                'origin_date': dates[origin],
+                'label': f"Forecast from {dates[origin].strftime('%Y-%m')}",
+            })
+        return panels
+
+    def predict_with_uncertainty(self, input_data: np.ndarray, cond=None,
                                 n_mc_samples: int = 30) -> Dict[str, np.ndarray]:
-        """Generate predictions with uncertainty using MC-Dropout."""
+        """MC-Dropout forecast from a raw input window.
+
+        ``input_data`` is a raw window: ``(W,)`` univariate or ``(W, C)`` multivariate.
+        ``cond`` is the raw (unscaled) conditioning scalar or None. Predictions are
+        inverse-transformed back to sunspot numbers via the target scaler (unchanged).
+        """
         if self.model is None:
             raise ValueError("Model not trained. Call train() first.")
-        
+
         self.model.eval()
-        
-        # Prepare input
-        if self.data_scaler is not None:
-            input_scaled = self.data_scaler.transform(input_data.reshape(-1, 1)).ravel()
+        input_data = np.asarray(input_data, dtype=float)
+
+        # Scale the input window.
+        if self.multi_scaler is not None:
+            input_scaled = self.multi_scaler.transform(input_data)          # (W, C)
+            input_tensor = torch.FloatTensor(input_scaled).unsqueeze(0).to(self.device)
         else:
-            input_scaled = input_data
-        
-        input_tensor = torch.FloatTensor(input_scaled).unsqueeze(0).unsqueeze(-1).to(self.device)
-        
+            input_scaled = self.data_scaler.transform(input_data.reshape(-1, 1)).ravel()
+            input_tensor = torch.FloatTensor(input_scaled).unsqueeze(0).unsqueeze(-1).to(self.device)
+
+        # Normalize the conditioning scalar.
+        cond_tensor = None
+        if cond is not None and self.cond_scaler is not None:
+            c = self.cond_scaler.transform(np.array([[float(cond)]])).ravel()
+            cond_tensor = torch.FloatTensor(c).unsqueeze(0).to(self.device)
+
         # Generate MC-Dropout predictions
-        mc_predictions = self.model.mc_predict(input_tensor, n_samples=n_mc_samples)
+        mc_predictions = self.model.mc_predict(input_tensor, cond=cond_tensor, n_samples=n_mc_samples)
         
         # Convert back to original scale
         if self.data_scaler is not None:
@@ -670,7 +809,7 @@ if __name__ == "__main__":
     })
     
     print("Testing data preparation...")
-    scaled_data, features, scaler = trainer.prepare_data(dummy_data, use_features=False)
-    print(f"Scaled data shape: {scaled_data.shape}")
-    
+    scaled_data, cond_series = trainer.prepare_data(dummy_data)
+    print(f"Scaled data shape: {scaled_data.shape}, cond: {cond_series}")
+
     print("\n✅ Seq2Seq trainer implemented and tested!")

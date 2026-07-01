@@ -1,0 +1,82 @@
+experiment_name: seq2seq_precursors
+seed: 42
+device: auto
+
+# Data configuration
+# Precursors: geomagnetic Ap/Kp as extra input channels (available from 1932),
+# plus the terminator/cycle-length conditioning precursor. start_year is 1818 so
+# full sunspot history is retained; pre-1932 geomagnetic is zero-filled + masked.
+data:
+  target_col: sunspot_number
+  start_year: 1818
+  input_window: 528
+  prediction_horizon: 132
+  add_features: true
+  feature_window: 13
+  precursor_cols: [ap_avg, kp_sum]
+  geomag_mask: true
+  use_terminator: true
+  normalization:
+    method: robust
+    transform: sqrt
+    quantile_range: [25.0, 75.0]
+
+# Model configuration
+# input_dim and cond_dim are derived automatically (resolve_derived_dims): here
+# input_dim -> 4 (sunspot + ap + kp + mask), cond_dim -> 1 (terminator).
+model:
+  name: WaveNetAttnSeq2Seq
+  input_dim: 1
+  d_model: 128
+  output_size: 132
+  wavenet:
+    stacks: 3
+    layers_per_stack: 4
+    kernel_size: 3
+    base_dilation: 1
+    channels: 128
+    dropout: 0.2
+  encoder_bilstm_hidden: 128
+  decoder_lstm_hidden: 128
+  decoder_layers: 2
+  decoder_heads: 4
+  attention: scaled_dot
+  head: quantile
+  quantiles: [0.1, 0.5, 0.9]
+  dropout: 0.2
+  mc_dropout_samples: 30
+
+# Training configuration
+# warmup_cosine scheduler (no LR restarts) + weight EMA for smooth curves.
+training:
+  epochs: 200
+  batch_size: 32
+  teacher_forcing: 0.0
+  optimizer: adamw
+  lr: 0.001
+  weight_decay: 0.0001
+  scheduler: warmup_cosine
+  warmup_epochs: 5
+  early_stop_patience: 25
+  grad_clip_norm: 1.0
+  amp: false
+  use_ema: true
+  ema_decay: 0.999
+  val_ratio: 0.2
+
+# Cross-validation configuration
+cv:
+  enabled: true
+  n_folds: 5
+  test_size: 132
+  min_train_size: 1000
+  gap_size: 0
+  method: rolling
+
+# Output configuration
+output_dir: data/experiments
+save_predictions: true
+save_model: true
+log_interval: 10
+plot_training: true
+plot_predictions: true

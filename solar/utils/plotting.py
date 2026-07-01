@@ -551,14 +551,121 @@ class SolarCyclePlotter:
         
         plt.suptitle(title, fontsize=16, fontweight='bold')
         plt.tight_layout()
-        
+
         if save_path:
             plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
-        
+
+        return fig
+
+    def plot_forecast_continuation(self,
+                                   history: np.ndarray,
+                                   forecast_mean: np.ndarray,
+                                   forecast_lower: np.ndarray,
+                                   forecast_upper: np.ndarray,
+                                   history_months: int = 264,
+                                   title: str = "Next Solar Cycle Forecast",
+                                   save_path: Optional[Path] = None) -> plt.Figure:
+        """Plot recent observed history followed by the forecast horizon.
+
+        The forecast is drawn as a continuation of the observed series with an
+        uncertainty band, separated by a 'forecast start' marker.
+        """
+        history = np.asarray(history)[-history_months:]
+        n_hist = len(history)
+        n_fcst = len(forecast_mean)
+        hist_x = np.arange(n_hist)
+        fcst_x = np.arange(n_hist, n_hist + n_fcst)
+
+        fig, ax = plt.subplots(figsize=(15, 8))
+        ax.plot(hist_x, history, color=self.colors.get('actual', '#1f77b4'),
+                linewidth=2.0, label='Observed history')
+        # Join history and forecast so the line is continuous.
+        ax.plot(np.r_[hist_x[-1], fcst_x], np.r_[history[-1], forecast_mean],
+                color=self.colors.get('prediction', '#b5179e'), linewidth=2.5,
+                label='Forecast (mean)')
+        ax.fill_between(fcst_x, forecast_lower, forecast_upper,
+                        color=self.colors.get('uncertainty', '#f4a261'), alpha=0.4,
+                        label='80% prediction interval')
+        ax.axvline(n_hist - 1, color='gray', linestyle='--', linewidth=1.5, alpha=0.8)
+
+        peak_idx = int(np.argmax(forecast_mean))
+        ax.scatter([fcst_x[peak_idx]], [forecast_mean[peak_idx]],
+                   color='crimson', zorder=5)
+        ax.annotate(f"predicted peak ≈ {forecast_mean[peak_idx]:.0f}\n(+{peak_idx + 1} months)",
+                    (fcst_x[peak_idx], forecast_mean[peak_idx]),
+                    textcoords="offset points", xytext=(6, 10), color='crimson', fontsize=10)
+
+        ax.set_title(title, fontsize=16, fontweight='bold')
+        ax.set_xlabel('Month index (observed history → forecast)')
+        ax.set_ylabel('Sunspot Number')
+        ax.legend(loc='upper left')
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
+
+        return fig
+
+    def plot_cycle_backtest(self,
+                            panels: List[Dict[str, Any]],
+                            ncols: int = 2,
+                            normalize: bool = True,
+                            title: str = "Cycle Backtest: Forecast vs Actual",
+                            save_path: Optional[Path] = None) -> plt.Figure:
+        """Grid of hindcast panels validating the model against past solar cycles.
+
+        Each panel shows the observed history (blue) up to a forecast origin, then
+        the model forecast (red) with its MC-Dropout interval and the actual
+        observed cycle (navy dots) overlaid, so predictions can be checked against
+        known outcomes. Each ``panel`` dict provides: history_dates,
+        history_values, forecast_dates, pred_mean, pred_lower, pred_upper, actual
+        (optional), origin_date, label.
+        """
+        n = len(panels)
+        nrows = -(-n // ncols)  # ceil
+        fig, axes = plt.subplots(nrows, ncols, figsize=(9 * ncols, 4.5 * nrows), squeeze=False)
+        axes = axes.flatten()
+
+        denom = 1.0
+        if normalize:
+            gmax = max((np.nanmax(p['history_values']) for p in panels), default=1.0)
+            denom = gmax if gmax > 0 else 1.0
+
+        for i, p in enumerate(panels):
+            ax = axes[i]
+            ax.plot(p['history_dates'], np.asarray(p['history_values']) / denom,
+                    color='#3a7ca5', linewidth=1.0, label='Observed history')
+            fd = p['forecast_dates']
+            ax.fill_between(fd, np.asarray(p['pred_lower']) / denom,
+                            np.asarray(p['pred_upper']) / denom,
+                            color=self.colors.get('uncertainty', '#f4a261'),
+                            alpha=0.35, label='80% MC interval')
+            if p.get('actual') is not None:
+                ax.plot(fd, np.asarray(p['actual']) / denom,
+                        color='#2ca02c', linewidth=2.0, zorder=3, label='Actual')
+            ax.plot(fd, np.asarray(p['pred_mean']) / denom,
+                    color='#d1495b', linewidth=2.0, zorder=4, label='Forecast (mean)')
+            ax.axvline(p['origin_date'], color='gray', linestyle='--', linewidth=1.0, alpha=0.7)
+            ax.set_title(p.get('label', ''), fontsize=11, fontweight='bold')
+            ax.grid(True, alpha=0.3)
+            if i == 0:
+                ax.legend(loc='upper left', fontsize=9)
+
+        for j in range(n, len(axes)):
+            axes[j].set_visible(False)
+
+        fig.supylabel('Sunspot number (normalized)' if normalize else 'Sunspot number')
+        fig.suptitle(title, fontsize=15, fontweight='bold')
+        plt.tight_layout()
+
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
+
         return fig
 
 
-def create_summary_report(results: Dict[str, Any], 
+def create_summary_report(results: Dict[str, Any],
                          output_dir: Path,
                          experiment_name: str = "Solar Cycle Prediction") -> None:
     """Create a comprehensive summary report with all visualizations."""

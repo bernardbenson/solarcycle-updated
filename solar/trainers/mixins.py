@@ -6,7 +6,10 @@ Provides early stopping, scheduling, AMP, and checkpointing capabilities.
 import torch
 import torch.nn as nn
 from torch.cuda.amp import GradScaler, autocast
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, ReduceLROnPlateau, StepLR
+from torch.optim.lr_scheduler import (
+    CosineAnnealingWarmRestarts, ReduceLROnPlateau, StepLR,
+    LinearLR, CosineAnnealingLR, SequentialLR,
+)
 from pathlib import Path
 from typing import Dict, Optional, Any, Union
 import numpy as np
@@ -96,7 +99,18 @@ class SchedulerMixin:
             T_0 = scheduler_config.get('warmup_epochs', 5)
             T_mult = scheduler_config.get('T_mult', 2)
             return CosineAnnealingWarmRestarts(optimizer, T_0=T_0, T_mult=T_mult)
-        
+
+        elif scheduler_type == "warmup_cosine":
+            # Linear warmup then a single cosine decay to eta_min (NO restarts) -> smooth LR.
+            warmup = max(1, scheduler_config.get('warmup_epochs', 5))
+            total = max(warmup + 1, scheduler_config.get('total_epochs', 100))
+            warm = LinearLR(optimizer,
+                            start_factor=scheduler_config.get('warmup_start_factor', 0.01),
+                            total_iters=warmup)
+            cos = CosineAnnealingLR(optimizer, T_max=max(1, total - warmup),
+                                    eta_min=scheduler_config.get('eta_min', 0.0))
+            return SequentialLR(optimizer, [warm, cos], milestones=[warmup])
+
         elif scheduler_type == "reduce_on_plateau":
             patience = scheduler_config.get('patience', 5)
             factor = scheduler_config.get('factor', 0.5)
@@ -306,16 +320,56 @@ class MetricsTrackingMixin:
             return int(np.argmax(values))
 
 
-class CombinedTrainerMixin(EarlyStoppingMixin, SchedulerMixin, AMPMixin, 
-                          CheckpointMixin, TeacherForcingMixin, MetricsTrackingMixin):
+class EMAMixin:
+    """Exponential moving average of model weights for smoother eval/checkpoints.
+
+    Maintains a shadow copy of ``model.state_dict()`` updated after each optimizer step.
+    Floating-point tensors are averaged; integer buffers (e.g. BatchNorm
+    ``num_batches_tracked``) are copied. Use ``copy_to``/``restore`` to evaluate or
+    checkpoint with the EMA weights and then swap the raw weights back.
+    """
+
+    def init_ema(self, model: nn.Module, decay: float = 0.999, enabled: bool = True):
+        self.ema_enabled = enabled
+        self.ema_decay = decay
+        self.ema_shadow = (
+            {k: v.detach().clone() for k, v in model.state_dict().items()}
+            if enabled else None
+        )
+
+    def update_ema(self, model: nn.Module):
+        if not getattr(self, 'ema_enabled', False):
+            return
+        with torch.no_grad():
+            for k, v in model.state_dict().items():
+                shadow = self.ema_shadow[k]
+                if v.dtype.is_floating_point:
+                    shadow.mul_(self.ema_decay).add_(v.detach(), alpha=1 - self.ema_decay)
+                else:
+                    shadow.copy_(v)
+
+    def copy_to(self, model: nn.Module) -> Dict:
+        """Swap EMA weights into the model, returning a backup of the raw weights."""
+        backup = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        model.load_state_dict(self.ema_shadow)
+        return backup
+
+    def restore(self, model: nn.Module, backup: Dict):
+        model.load_state_dict(backup)
+
+
+class CombinedTrainerMixin(EarlyStoppingMixin, SchedulerMixin, AMPMixin,
+                          CheckpointMixin, TeacherForcingMixin, MetricsTrackingMixin,
+                          EMAMixin):
     """Combined mixin with all training utilities."""
-    
+
     def __init__(self, patience: int = 15, use_amp: bool = True,
                  teacher_forcing_ratio: float = 0.5, **kwargs):
         EarlyStoppingMixin.__init__(self, patience=patience)
         AMPMixin.__init__(self, use_amp=use_amp)
         TeacherForcingMixin.__init__(self, initial_ratio=teacher_forcing_ratio)
         MetricsTrackingMixin.__init__(self)
+        self.ema_enabled = False  # armed later via init_ema()
 
 
 if __name__ == "__main__":

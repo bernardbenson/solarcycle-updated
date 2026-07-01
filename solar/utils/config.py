@@ -41,6 +41,7 @@ class OptimizerType(str, Enum):
 
 class SchedulerType(str, Enum):
     COSINE_WITH_WARMUP = "cosine_with_warmup"
+    WARMUP_COSINE = "warmup_cosine"
     REDUCE_ON_PLATEAU = "reduce_on_plateau"
     STEP = "step"
     NONE = "none"
@@ -82,10 +83,16 @@ class ModelConfig(BaseModel):
     # Encoder LSTM
     encoder_bilstm_hidden: int = Field(default=128, ge=32, le=512, description="Encoder BiLSTM hidden size")
     
-    # Decoder
-    decoder_lstm_hidden: int = Field(default=128, ge=32, le=512, description="Decoder LSTM hidden size")
+    # Decoder (non-autoregressive attention decoder)
+    decoder_lstm_hidden: int = Field(default=128, ge=32, le=512, description="Decoder hidden size (legacy)")
+    decoder_layers: int = Field(default=2, ge=1, le=8, description="Transformer decoder layers")
+    decoder_heads: int = Field(default=4, ge=1, le=16, description="Decoder attention heads")
     attention: AttentionType = Field(default=AttentionType.SCALED_DOT)
     
+    # Precursor conditioning dimension (0 = no conditioning). Derived from
+    # data.use_terminator by resolve_derived_dims(); do not set by hand.
+    cond_dim: int = Field(default=0, ge=0, description="Precursor conditioning vector size")
+
     # Prediction head
     head: HeadType = Field(default=HeadType.QUANTILE)
     quantiles: List[float] = Field(default=[0.1, 0.5, 0.9], description="Quantile levels")
@@ -134,7 +141,11 @@ class TrainingConfig(BaseModel):
     
     # Performance
     amp: bool = Field(default=False, description="Use automatic mixed precision (CUDA only)")
-    
+
+    # Weight EMA (exponential moving average) for smoother validation curves
+    use_ema: bool = Field(default=False, description="Track an EMA of weights for eval/checkpoint")
+    ema_decay: float = Field(default=0.999, ge=0.5, le=0.9999, description="EMA decay rate")
+
     # Validation
     val_ratio: float = Field(default=0.2, gt=0.0, lt=1.0, description="Validation set ratio")
 
@@ -159,7 +170,13 @@ class DataConfig(BaseModel):
     # Features
     add_features: bool = Field(default=True, description="Add engineered features")
     feature_window: int = Field(default=13, ge=1, description="Window for feature engineering")
-    
+
+    # Precursors (exogenous input channels + terminator conditioning).
+    # Empty precursor_cols => univariate (backward compatible).
+    precursor_cols: List[str] = Field(default=[], description="Exogenous columns fed as extra input channels")
+    geomag_mask: bool = Field(default=True, description="Add a binary availability-mask channel for precursors")
+    use_terminator: bool = Field(default=False, description="Condition on the terminator/cycle-length precursor")
+
     # Normalization
     normalization: NormalizationConfig = Field(default_factory=NormalizationConfig)
 
@@ -187,17 +204,32 @@ class ExperimentConfig(BaseModel):
     plot_predictions: bool = Field(default=True, description="Generate prediction plots")
 
 
+def resolve_derived_dims(config: ExperimentConfig) -> ExperimentConfig:
+    """Derive model input_dim / cond_dim from the data config.
+
+    Keeps train() and load_trained() in agreement on tensor shapes:
+    - input_dim = sunspot (1) + one channel per precursor column + an optional
+      availability-mask channel.
+    - cond_dim  = 1 when the terminator/cycle-length precursor is enabled, else 0.
+    """
+    n_precursors = len(config.data.precursor_cols)
+    mask_channel = 1 if (config.data.geomag_mask and n_precursors > 0) else 0
+    config.model.input_dim = 1 + n_precursors + mask_channel
+    config.model.cond_dim = 1 if config.data.use_terminator else 0
+    return config
+
+
 def load_config(config_path: Union[str, Path]) -> ExperimentConfig:
     """Load configuration from YAML file."""
     config_path = Path(config_path)
-    
+
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
-    
+
     with open(config_path, 'r') as f:
         config_dict = yaml.safe_load(f)
-    
-    return ExperimentConfig(**config_dict)
+
+    return resolve_derived_dims(ExperimentConfig(**config_dict))
 
 
 def save_config(config: ExperimentConfig, config_path: Union[str, Path]) -> None:

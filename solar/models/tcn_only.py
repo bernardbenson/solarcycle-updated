@@ -212,12 +212,13 @@ class TCNOnly(nn.Module):
             if isinstance(module, nn.Dropout):
                 module.train()
     
-    def mc_predict(self, x: torch.Tensor, n_samples: int = 30) -> torch.Tensor:
+    def mc_predict(self, x: torch.Tensor, cond=None, n_samples: int = 30) -> torch.Tensor:
         """
         Generate MC-Dropout predictions for uncertainty estimation.
-        
+
         Args:
             x: Input sequences (batch_size, seq_len, input_dim)
+            cond: Unused (accepted for a uniform trainer interface)
             n_samples: Number of MC samples
         
         Returns:
