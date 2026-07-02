@@ -9,8 +9,9 @@ import argparse
 from pathlib import Path
 import torch
 
-# Add the project root to the path
+# Add the project root (for `solar.*`) and the scripts dir (for `backtest`) to the path
 sys.path.append(str(Path(__file__).parent.parent))
+sys.path.append(str(Path(__file__).parent))
 
 from solar.utils.config import load_config, ExperimentConfig
 from solar.trainers.seq2seq_trainer import Seq2SeqTrainer
@@ -66,7 +67,11 @@ def main():
                        help='Override number of training epochs')
     parser.add_argument('--batch-size', type=int, default=None,
                        help='Override batch size')
-    
+    parser.add_argument('--no-backtest', action='store_true',
+                       help='Skip the hindcast backtest that runs automatically after training')
+    parser.add_argument('--backtest-panels', type=int, default=4,
+                       help='Number of past cycles to validate in the post-training backtest')
+
     args = parser.parse_args()
     
     # Test device compatibility
@@ -133,9 +138,21 @@ def main():
             config.experiment_name,
         )
         
+        # Hindcast backtest against past cycles (writes plots/cycle_backtest.png).
+        # Reuses the already-loaded dataframe; reloads the best checkpoint from disk
+        # so it validates exactly what a standalone `scripts/backtest.py` run would.
+        if not args.no_backtest:
+            print("\nRunning hindcast backtest against past cycles...")
+            try:
+                from backtest import run_backtest
+                run_backtest(config, output_dir, device=device,
+                             n_panels=args.backtest_panels, df=df)
+            except Exception as e:
+                print(f"⚠️  Backtest step failed (training results are unaffected): {e}")
+
         print(f"\n✅ Training pipeline completed successfully!")
         print(f"All results saved to: {output_dir}")
-        
+
     except Exception as e:
         print(f"\n❌ Training failed with error: {e}")
         import traceback
