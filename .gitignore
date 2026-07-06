@@ -39,8 +39,10 @@ MANIFEST
 pip-log.txt
 pip-delete-this-directory.txt
 
-#data 
-data/
+#data
+data/*
+# but keep the raw uploaded dataset under version control
+!data/raw_multivariate_data.csv
 # Unit test / coverage reports
 htmlcov/
 .tox/
