@@ -38,20 +38,24 @@ def run_backtest(config, run_dir, device='auto', n_panels=4, raw_units=False, df
     trainer.load_trained(run_dir)
 
     if df is None:
-        df = load_solar_data()
+        df = load_solar_data(dataset=config.data.dataset,
+                             need_precursors=bool(config.data.precursor_cols))
     panels = trainer.backtest_cycles(df, n_panels=n_panels)
     print(f"Built {len(panels)} backtest panels.\n")
 
-    # Per-cycle validation metrics (mean forecast vs actual).
-    print(f"{'Origin':<10}{'RMSE':>8}{'PeakErr(mo)':>13}{'PeakErr(SN)':>13}")
+    # Per-cycle validation metrics (median forecast vs actual, raw units; peak
+    # errors on the standard 13-month smoothed series). Panels whose horizon
+    # overlaps the model's training era are flagged - their numbers are
+    # optimistic. For honest per-origin retraining, use scripts/run_cv.py.
+    from solar.eval.metrics import forecast_metrics
+    print(f"{'Origin':<10}{'RMSE':>8}{'PeakErr(mo)':>13}{'PeakErr(SN)':>13}{'Cover80':>9}  ")
     for p in panels:
-        actual = np.asarray(p['actual'])
-        pred = np.asarray(p['pred_mean'])
-        rmse = float(np.sqrt(np.mean((actual - pred) ** 2)))
-        peak_err_months = int(np.argmax(pred) - np.argmax(actual))
-        peak_err_sn = float(np.max(pred) - np.max(actual))
+        m = forecast_metrics(np.asarray(p['actual']), np.asarray(p['pred_mean']),
+                             q10=np.asarray(p['pred_lower']), q90=np.asarray(p['pred_upper']))
         origin = p['origin_date'].strftime('%Y-%m')
-        print(f"{origin:<10}{rmse:>8.1f}{peak_err_months:>13d}{peak_err_sn:>13.1f}")
+        flag = '  [IN-SAMPLE]' if p.get('in_sample') else ''
+        print(f"{origin:<10}{m['rmse']:>8.1f}{m['peak_timing_err']:>13.0f}"
+              f"{m['peak_amp_err']:>13.1f}{m.get('coverage_80', float('nan')):>9.2f}{flag}")
 
     plotter = SolarCyclePlotter(style='publication')
     out_path = run_dir / "plots" / "cycle_backtest.png"

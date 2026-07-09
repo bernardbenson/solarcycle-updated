@@ -24,6 +24,7 @@ class HeadType(str, Enum):
 class NormalizationMethod(str, Enum):
     STANDARD = "standard"
     ROBUST = "robust"
+    MINMAX = "minmax"
     NONE = "none"
 
 
@@ -31,6 +32,7 @@ class TransformMethod(str, Enum):
     IDENTITY = "identity"
     LOG1P = "log1p"
     SQRT = "sqrt"
+    ASINH = "asinh"
 
 
 class OptimizerType(str, Enum):
@@ -53,8 +55,16 @@ class WaveNetConfig(BaseModel):
     layers_per_stack: int = Field(default=4, ge=1, le=10, description="Layers per stack")
     kernel_size: int = Field(default=3, ge=2, le=7, description="Convolution kernel size")
     base_dilation: int = Field(default=1, ge=1, description="Base dilation rate")
-    channels: int = Field(default=128, ge=32, le=512, description="Number of channels")
+    channels: int = Field(default=128, ge=8, le=512, description="Number of channels")
     dropout: float = Field(default=0.2, ge=0.0, le=0.8, description="Dropout rate")
+
+    # Used by WaveNetLSTMDirect: continuously doubling dilations 1,2,...,2^(num_layers-1)
+    # (receptive field = 1 + (kernel_size-1)*(2^num_layers - 1), so 10 layers @ k=2
+    # covers 1024 months >= the 528-month input window).
+    num_layers: int = Field(default=10, ge=1, le=14,
+                            description="Layers with continuously doubling dilation (WaveNetLSTMDirect)")
+    norm: str = Field(default="weight",
+                      description="Conv normalization for WaveNetLSTMDirect: weight, group, or none")
 
 
 class NormalizationConfig(BaseModel):
@@ -135,6 +145,10 @@ class TrainingConfig(BaseModel):
     
     # Early stopping
     early_stop_patience: int = Field(default=20, ge=1, description="Early stopping patience")
+    early_stop_metric: str = Field(
+        default="val_loss",
+        description="Metric monitored for early stopping / best checkpoint "
+                    "(val_loss = scaled training loss; val_rmse_raw = RMSE in raw target units)")
     
     # Regularization
     grad_clip_norm: float = Field(default=1.0, gt=0.0, description="Gradient clipping norm")
@@ -148,6 +162,8 @@ class TrainingConfig(BaseModel):
 
     # Validation
     val_ratio: float = Field(default=0.2, gt=0.0, lt=1.0, description="Validation set ratio")
+    val_stride: int = Field(default=12, ge=1,
+                            description="Stride (months) between validation forecast origins")
 
 
 class CVConfig(BaseModel):
@@ -162,6 +178,7 @@ class CVConfig(BaseModel):
 
 class DataConfig(BaseModel):
     """Data configuration."""
+    dataset: str = Field(default="ssn", description="Dataset: 'ssn' (sunspot number) or 'area' (total sunspot area)")
     target_col: str = Field(default="sunspot_number", description="Target column name")
     start_year: int = Field(default=1749, ge=1700, le=2100, description="Starting year for data")
     input_window: int = Field(default=528, ge=100, description="Input window size (months)")

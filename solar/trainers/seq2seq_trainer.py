@@ -16,15 +16,18 @@ import matplotlib.pyplot as plt
 # Import our components
 from .mixins import CombinedTrainerMixin
 from ..models.wavenet_attn_seq2seq import WaveNetAttnSeq2Seq
+from ..models.wavenet_lstm_direct import WaveNetLSTMDirect
 from ..models.tcn_only import TCNOnly
 from ..models.nbeatsx import NBEATSx
 from ..models.heads import pinball_loss, quantile_loss_with_coverage, compute_combined_loss
-from ..utils.rolling_cv import RollingOriginCV, BlockedTimeSeriesCV, TimeSeriesMetrics
-from ..utils.peak_metrics import PeakMetrics, ConformalPeakPredictor
+from ..data.monthly import build_monthly_series
+from ..eval.metrics import forecast_metrics, aggregate_metrics
+from ..utils.peak_metrics import PeakMetrics
 from ..utils.normalization import (
     RobustScaler, MultiChannelScaler, prepare_multivariate_monthly_data,
 )
 from ..utils.precursors import detect_cycle_minima, cycle_length_series
+from ..utils.splits import time_axis_split, assert_no_target_overlap
 from ..utils.config import ExperimentConfig
 from ..utils.plotting import SolarCyclePlotter
 
@@ -39,24 +42,32 @@ class SolarSequenceDataset(Dataset):
     """
 
     def __init__(self, data: np.ndarray, cond: Optional[np.ndarray] = None,
-                 input_window: int = 528, output_window: int = 132, step: int = 1):
+                 input_window: int = 528, output_window: int = 132, step: int = 1,
+                 origins: Optional[List[int]] = None):
         data = np.asarray(data, dtype=np.float32)
         multivariate = data.ndim == 2
         cond_dim = 0 if cond is None else 1
 
+        # A window is identified by its forecast origin o: input [o-W, o), target
+        # [o, o+H). Explicit `origins` lets callers build leak-free splits; the
+        # default enumerates every valid origin at the given stride.
+        if origins is None:
+            origins = list(range(input_window, len(data) - output_window + 1, step))
+
         self.sequences, self.targets, self.conds = [], [], []
-        for i in range(0, len(data) - input_window - output_window + 1, step):
-            window = data[i:i + input_window]
+        for o in origins:
+            if o < input_window or o + output_window > len(data):
+                raise ValueError(f"Origin {o} out of range for series of length {len(data)}")
+            window = data[o - input_window:o]
             input_seq = torch.from_numpy(window if multivariate else window[:, None])
 
-            target_end = i + input_window + output_window
-            target_col = data[i + input_window:target_end]
+            target_col = data[o:o + output_window]
             target_seq = torch.from_numpy(target_col[:, 0] if multivariate else target_col)
 
             self.sequences.append(input_seq)
             self.targets.append(target_seq)
             if cond_dim:
-                self.conds.append(torch.tensor([cond[i + input_window - 1]], dtype=torch.float32))
+                self.conds.append(torch.tensor([cond[o - 1]], dtype=torch.float32))
             else:
                 self.conds.append(torch.zeros(0, dtype=torch.float32))
 
@@ -77,7 +88,6 @@ class Seq2SeqTrainer(CombinedTrainerMixin):
         super().__init__(
             patience=config.training.early_stop_patience,
             use_amp=config.training.amp,
-            teacher_forcing_ratio=config.training.teacher_forcing
         )
         
         self.config = config
@@ -102,7 +112,6 @@ class Seq2SeqTrainer(CombinedTrainerMixin):
         self.cond_scaler = None          # normaliser for the terminator conditioning scalar
         self._train_df = None            # df used for training (for plot rebuilding)
         self.peak_detector = PeakMetrics()
-        self.conformal_predictor = ConformalPeakPredictor()
         
         # Set random seeds
         self._set_seeds(config.seed)
@@ -125,6 +134,12 @@ class Seq2SeqTrainer(CombinedTrainerMixin):
             'quantile_range': self.config.data.normalization.quantile_range,
         }
 
+    def _train_boundary(self, n_months: int) -> int:
+        """Time-axis train/val boundary: everything at/after it is validation era."""
+        horizon = self.config.data.prediction_horizon
+        val_months = max(horizon, int(round(self.config.training.val_ratio * n_months)))
+        return n_months - val_months
+
     def prepare_data(self, df) -> Tuple[np.ndarray, Optional[np.ndarray]]:
         """Prepare scaled model inputs and optional precursor conditioning.
 
@@ -132,42 +147,52 @@ class Seq2SeqTrainer(CombinedTrainerMixin):
         or ``(T, C)`` multivariate (channel 0 = target); ``cond_series`` is a normalized
         ``(T,)`` terminator series or None. Sets ``self.data_scaler`` (target),
         ``self.multi_scaler`` and ``self.cond_scaler``.
+
+        All scalers are fit on the training era only (months before the time-axis
+        split boundary, ``self.t_split``) and then applied to the full series.
         """
-        import pandas as pd
         scaler_config = self._scaler_config()
         precursor_cols = list(self.config.data.precursor_cols)
 
         if precursor_cols:
-            X_scaled, X_raw, multi_scaler, _dates = prepare_multivariate_monthly_data(
+            # Boundary must be known before fitting: compute the monthly length first.
+            monthly = build_monthly_series(df, target_col=self.config.data.target_col,
+                                           start_year=self.config.data.start_year)
+            self.t_split = self._train_boundary(len(monthly))
+            X_scaled, X_raw, multi_scaler, dates = prepare_multivariate_monthly_data(
                 df,
                 target_col=self.config.data.target_col,
                 precursor_cols=precursor_cols,
                 geomag_mask=self.config.data.geomag_mask,
                 start_year=self.config.data.start_year,
                 scaler_config=scaler_config,
+                fit_end_idx=self.t_split,
             )
             self.multi_scaler = multi_scaler
             self.data_scaler = multi_scaler.target_scaler
             scaled_input = X_scaled
             raw_target = X_raw[:, 0]
         else:
-            d = df.copy()
-            d['date'] = pd.to_datetime(d['date'])
-            d = d.set_index('date')
-            d = d[d.index.year >= self.config.data.start_year]
-            monthly = d[self.config.data.target_col].resample('ME').mean().dropna()
+            monthly = build_monthly_series(df, target_col=self.config.data.target_col,
+                                           start_year=self.config.data.start_year)
+            self.t_split = self._train_boundary(len(monthly))
             self.data_scaler = RobustScaler(**scaler_config)
-            scaled_input = self.data_scaler.fit_transform(monthly.values)
+            self.data_scaler.fit(monthly.values[:self.t_split])
+            scaled_input = self.data_scaler.transform(monthly.values)
             self.multi_scaler = None
             raw_target = monthly.values
+            dates = monthly.index
+
+        self._train_dates = dates
 
         cond_series = None
         self.cond_scaler = None
         if self.config.data.use_terminator:
+            # cycle_length_series is causal (confirmed minima only), so the full
+            # series can be built once; only the scaler must be train-era fit.
             cond_raw = cycle_length_series(raw_target, self.config.data.prediction_horizon)
-            train_end = max(1, int(len(cond_raw) * (1.0 - self.config.training.val_ratio)))
             self.cond_scaler = RobustScaler(method='standard', transform='identity')
-            self.cond_scaler.fit(cond_raw[:train_end])
+            self.cond_scaler.fit(cond_raw[:self.t_split])
             if self.cond_scaler.scaler is not None and hasattr(self.cond_scaler.scaler, 'scale_'):
                 # Guard against a degenerate (constant) training slice.
                 self.cond_scaler.scaler.scale_ = np.maximum(self.cond_scaler.scaler.scale_, 1e-6)
@@ -175,34 +200,40 @@ class Seq2SeqTrainer(CombinedTrainerMixin):
 
         return scaled_input, cond_series
 
-    def create_data_loaders(self, data: np.ndarray, cond: Optional[np.ndarray] = None,
-                           train_ratio: float = 0.8) -> Tuple[DataLoader, DataLoader]:
-        """Create train and validation data loaders."""
-        dataset = SolarSequenceDataset(
-            data, cond,
-            input_window=self.config.data.input_window,
-            output_window=self.config.data.prediction_horizon,
-            step=1
+    def create_data_loaders(self, data: np.ndarray, cond: Optional[np.ndarray] = None
+                            ) -> Tuple[DataLoader, DataLoader]:
+        """Create leak-free train and validation data loaders.
+
+        The split is on the TIME axis (see solar.utils.splits): train targets end
+        before ``self.t_split``; validation forecast origins start at it. Train
+        and validation target months are disjoint (asserted).
+        """
+        input_window = self.config.data.input_window
+        horizon = self.config.data.prediction_horizon
+
+        train_origins, val_origins, _ = time_axis_split(
+            len(data), input_window, horizon,
+            val_ratio=self.config.training.val_ratio,
+            val_stride=self.config.training.val_stride,
         )
-        
-        # Split dataset
-        total_samples = len(dataset)
-        train_size = int(total_samples * train_ratio)
-        
-        train_indices = list(range(train_size))
-        val_indices = list(range(train_size, total_samples))
-        
-        train_dataset = torch.utils.data.Subset(dataset, train_indices)
-        val_dataset = torch.utils.data.Subset(dataset, val_indices)
-        
+        assert_no_target_overlap(train_origins, val_origins, horizon)
+
+        train_dataset = SolarSequenceDataset(
+            data, cond, input_window=input_window, output_window=horizon,
+            origins=train_origins)
+        val_dataset = SolarSequenceDataset(
+            data, cond, input_window=input_window, output_window=horizon,
+            origins=val_origins)
+
         train_loader = DataLoader(
             train_dataset,
             batch_size=self.config.training.batch_size,
             shuffle=True,
+            drop_last=len(train_dataset) > self.config.training.batch_size,
             num_workers=0,
             pin_memory=self.device.type == 'cuda'
         )
-        
+
         val_loader = DataLoader(
             val_dataset,
             batch_size=self.config.training.batch_size,
@@ -210,11 +241,12 @@ class Seq2SeqTrainer(CombinedTrainerMixin):
             num_workers=0,
             pin_memory=self.device.type == 'cuda'
         )
-        
+
         return train_loader, val_loader
     
     # Available architectures, selected via config.model.name.
     MODEL_REGISTRY = {
+        'WaveNetLSTM': WaveNetLSTMDirect,
         'WaveNetAttnSeq2Seq': WaveNetAttnSeq2Seq,
         'TCNOnly': TCNOnly,
         'NBEATSx': NBEATSx,
@@ -291,15 +323,12 @@ class Seq2SeqTrainer(CombinedTrainerMixin):
                    optimizer: torch.optim.Optimizer, epoch: int) -> Dict[str, float]:
         """Train for one epoch."""
         model.train()
-        
+
         epoch_losses = []
         epoch_components = {}
-        
-        # Get current teacher forcing ratio
-        tf_ratio = self.get_teacher_forcing_ratio(epoch)
-        
+
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
-        
+
         for batch_idx, batch in enumerate(progress_bar):
             inputs, targets, cond = batch
             inputs = inputs.to(self.device)
@@ -308,10 +337,11 @@ class Seq2SeqTrainer(CombinedTrainerMixin):
 
             optimizer.zero_grad()
 
-            # Forward pass with autocast. cond/targets/teacher_forcing_ratio are passed by
-            # keyword so feed-forward models (TCN, N-BEATS) can ignore them via **kwargs.
+            # Forward pass with autocast. All registered models are direct
+            # (non-autoregressive) forecasters; cond is passed by keyword so
+            # models without conditioning ignore it via **kwargs.
             with self.autocast_context():
-                outputs = model(inputs, cond=cond, targets=targets, teacher_forcing_ratio=tf_ratio)
+                outputs = model(inputs, cond=cond)
                 loss, loss_components = self.compute_loss(outputs, targets)
 
             # Backward pass with gradient scaling
@@ -332,27 +362,47 @@ class Seq2SeqTrainer(CombinedTrainerMixin):
                 epoch_components[key].append(value)
             
             # Update progress bar
-            progress_bar.set_postfix({
-                'loss': f"{loss.item():.4f}",
-                'tf_ratio': f"{tf_ratio:.3f}"
-            })
-        
+            progress_bar.set_postfix({'loss': f"{loss.item():.4f}"})
+
         # Aggregate epoch metrics
         epoch_metrics = {'train_loss': np.mean(epoch_losses)}
         for key, values in epoch_components.items():
             epoch_metrics[f'train_{key}'] = np.mean(values)
-        
-        epoch_metrics['teacher_forcing_ratio'] = tf_ratio
-        
+
         return epoch_metrics
     
+    def _inverse_target(self, scaled: np.ndarray) -> np.ndarray:
+        """Inverse-transform scaled target values to raw units, clipped at 0."""
+        raw = self.data_scaler.inverse_transform(
+            np.asarray(scaled, dtype=float).reshape(-1, 1)).ravel()
+        return np.clip(raw, 0.0, None).reshape(np.asarray(scaled).shape)
+
+    def _split_quantile_outputs(self, preds: torch.Tensor
+                                ) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
+        """(B,H) or (B,H,nq) scaled predictions -> raw-unit (point, q10, q90)."""
+        preds = preds.detach().cpu().numpy()
+        if preds.ndim == 3:
+            quantiles = self.config.model.quantiles
+            median_idx = quantiles.index(0.5) if 0.5 in quantiles else len(quantiles) // 2
+            point = self._inverse_target(preds[:, :, median_idx])
+            q10 = self._inverse_target(preds[:, :, 0])
+            q90 = self._inverse_target(preds[:, :, -1])
+            return point, q10, q90
+        return self._inverse_target(preds), None, None
+
     def validate_epoch(self, model: nn.Module, val_loader: DataLoader) -> Dict[str, float]:
-        """Validate for one epoch."""
+        """Validate for one epoch.
+
+        Reports both the scaled training loss (val_loss) and raw-unit metrics
+        (val_rmse_raw, val_mae_raw, peak errors, 80% coverage) computed after
+        inverse-transforming predictions back to physical target units.
+        """
         model.eval()
-        
+
         val_losses = []
         val_components = {}
-        
+        window_metrics = []
+
         with torch.no_grad():
             for batch in val_loader:
                 inputs, targets, cond = batch
@@ -360,22 +410,39 @@ class Seq2SeqTrainer(CombinedTrainerMixin):
                 targets = targets.to(self.device)
                 cond = self._batch_cond(cond)
 
-                # Forward pass without teacher forcing
                 with self.autocast_context():
-                    outputs = model(inputs, cond=cond, teacher_forcing_ratio=0.0)
+                    outputs = model(inputs, cond=cond)
                     loss, loss_components = self.compute_loss(outputs, targets)
-                
+
                 val_losses.append(loss.item())
                 for key, value in loss_components.items():
                     if key not in val_components:
                         val_components[key] = []
                     val_components[key].append(value)
-        
+
+                # Raw-unit metrics per validation window.
+                preds = outputs['quantile'] if 'quantile' in outputs else outputs['predictions']
+                point, q10, q90 = self._split_quantile_outputs(preds)
+                actual = self._inverse_target(targets.detach().cpu().numpy())
+                for i in range(point.shape[0]):
+                    window_metrics.append(forecast_metrics(
+                        actual[i], point[i],
+                        q10=q10[i] if q10 is not None else None,
+                        q90=q90[i] if q90 is not None else None))
+
         # Aggregate validation metrics
         val_metrics = {'val_loss': np.mean(val_losses)}
         for key, values in val_components.items():
             val_metrics[f'val_{key}'] = np.mean(values)
-        
+
+        raw = aggregate_metrics(window_metrics)
+        val_metrics['val_rmse_raw'] = raw.get('rmse', float('nan'))
+        val_metrics['val_mae_raw'] = raw.get('mae', float('nan'))
+        val_metrics['val_peak_amp_mae'] = raw.get('peak_amp_mae', float('nan'))
+        val_metrics['val_peak_timing_mae'] = raw.get('peak_timing_mae', float('nan'))
+        if 'coverage_80' in raw:
+            val_metrics['val_coverage_80_raw'] = raw['coverage_80']
+
         return val_metrics
     
     def train(self, df, output_dir: Optional[Union[str, Path]] = None) -> Dict[str, Any]:
@@ -433,12 +500,23 @@ class Seq2SeqTrainer(CombinedTrainerMixin):
 
         print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-        # Create data loaders
-        train_loader, val_loader = self.create_data_loaders(
-            scaled_data, cond_series, train_ratio=1.0 - self.config.training.val_ratio
-        )
-        
-        print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
+        # Create data loaders (leak-free time-axis split at self.t_split).
+        train_loader, val_loader = self.create_data_loaders(scaled_data, cond_series)
+
+        train_end_date = str(self._train_dates[self.t_split - 1].date()) \
+            if getattr(self, '_train_dates', None) is not None else None
+        print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)} "
+              f"(train era ends {train_end_date})")
+
+        # Persist run metadata so backtests can distinguish in-sample panels.
+        import json as _json
+        with open(output_dir / "run_meta.json", 'w') as f:
+            _json.dump({
+                't_split': int(self.t_split),
+                'train_end_date': train_end_date,
+                'n_months': int(len(scaled_data)),
+                'model_name': self.config.model.name,
+            }, f, indent=2)
         
         # Create optimizer and scheduler
         optimizer = self.create_optimizer(model)
@@ -453,11 +531,15 @@ class Seq2SeqTrainer(CombinedTrainerMixin):
             }
         )
         
-        # Training loop
-        print(f"Starting training for {self.config.training.epochs} epochs...")
-        
-        best_val_loss = float('inf')
-        
+        # Training loop. Early stopping, LR plateau, and best-checkpoint selection
+        # all monitor config.training.early_stop_metric (e.g. val_rmse_raw, the
+        # RMSE in physical target units) - never the scaled loss unless asked.
+        monitor_key = self.config.training.early_stop_metric
+        print(f"Starting training for {self.config.training.epochs} epochs "
+              f"(monitoring {monitor_key})...")
+
+        best_monitor = float('inf')
+
         for epoch in range(self.config.training.epochs):
             # Train epoch
             train_metrics = self.train_epoch(model, train_loader, optimizer, epoch)
@@ -469,10 +551,13 @@ class Seq2SeqTrainer(CombinedTrainerMixin):
 
             # Validation epoch
             val_metrics = self.validate_epoch(model, val_loader)
+            monitored = val_metrics.get(monitor_key, val_metrics['val_loss'])
+            if not np.isfinite(monitored):
+                monitored = val_metrics['val_loss']
 
             # Combine metrics
             epoch_metrics = {**train_metrics, **val_metrics}
-            
+
             # Log metrics (train_loss/val_loss are passed explicitly; the rest as extras).
             current_lr = optimizer.param_groups[0]['lr']
             extra_metrics = {k: v for k, v in epoch_metrics.items()
@@ -484,30 +569,27 @@ class Seq2SeqTrainer(CombinedTrainerMixin):
                 lr=current_lr,
                 **extra_metrics
             )
-            
+
             # Step scheduler
-            self.step_scheduler(scheduler, self.config.training.scheduler, val_metrics['val_loss'])
-            
-            # Step teacher forcing
-            self.step_teacher_forcing()
-            
+            self.step_scheduler(scheduler, self.config.training.scheduler, monitored)
+
             # Early stopping check
-            should_stop = self.step(val_metrics['val_loss'], model, epoch)
-            
+            should_stop = self.step(monitored, model, epoch)
+
             # Logging
             if (epoch + 1) % self.config.log_interval == 0 or epoch == 0:
                 print(f"Epoch {epoch+1:3d}/{self.config.training.epochs}: "
                       f"Train Loss: {train_metrics['train_loss']:.4f}, "
                       f"Val Loss: {val_metrics['val_loss']:.4f}, "
-                      f"LR: {current_lr:.2e}, "
-                      f"TF: {train_metrics['teacher_forcing_ratio']:.3f}")
-            
+                      f"Val RMSE (raw): {val_metrics.get('val_rmse_raw', float('nan')):.2f}, "
+                      f"LR: {current_lr:.2e}")
+
             # Save best model (EMA weights when enabled).
-            if val_metrics['val_loss'] < best_val_loss:
-                best_val_loss = val_metrics['val_loss']
+            if monitored < best_monitor:
+                best_monitor = monitored
                 if self.config.save_model:
                     self.save_checkpoint(
-                        model, optimizer, scheduler, epoch, val_metrics['val_loss'],
+                        model, optimizer, scheduler, epoch, monitored,
                         output_dir / "best_model.pt"
                     )
 
@@ -526,7 +608,7 @@ class Seq2SeqTrainer(CombinedTrainerMixin):
         # Save final model (last-epoch weights)
         if self.config.save_model:
             self.save_checkpoint(
-                model, optimizer, scheduler, epoch, val_metrics['val_loss'],
+                model, optimizer, scheduler, epoch, monitored,
                 output_dir / "final_model.pt"
             )
 
@@ -536,12 +618,18 @@ class Seq2SeqTrainer(CombinedTrainerMixin):
             model.load_state_dict({k: v.to(device) for k, v in self.best_weights.items()})
 
         # Training results
+        best_epoch = self.get_best_epoch(monitor_key if monitor_key in self.metrics_history
+                                         else 'val_loss')
         training_results = {
-            'best_epoch': self.get_best_epoch('val_loss'),
-            'best_val_loss': best_val_loss,
+            'best_epoch': best_epoch,
+            'monitor_metric': monitor_key,
+            'best_val_loss': best_monitor,
+            'best_val_rmse_raw': float(np.min(self.metrics_history['val_rmse_raw']))
+                if self.metrics_history.get('val_rmse_raw') else None,
             'total_epochs': epoch + 1,
             'early_stopped': self.early_stopped,
             'model_parameters': sum(p.numel() for p in model.parameters()),
+            'train_end_date': train_end_date,
             'output_dir': str(output_dir)
         }
         
@@ -639,16 +727,20 @@ class Seq2SeqTrainer(CombinedTrainerMixin):
         cond_scaler = run_dir / "cond_scaler.json"
         if cond_scaler.exists():
             self.cond_scaler = RobustScaler.load_params(cond_scaler)
+
+        # Train-era boundary (for labeling in-sample backtest panels honestly).
+        self.train_end_date = None
+        meta_path = run_dir / "run_meta.json"
+        if meta_path.exists():
+            import json as _json
+            with open(meta_path) as f:
+                self.train_end_date = _json.load(f).get('train_end_date')
         return self
 
     def _monthly_series(self, df) -> Tuple[np.ndarray, 'Any']:
-        """Return the raw monthly target series and its DatetimeIndex."""
-        import pandas as pd
-        d = df.copy()
-        d['date'] = pd.to_datetime(d['date'])
-        d = d.set_index('date')
-        d = d[d.index.year >= self.config.data.start_year]
-        monthly = d[self.config.data.target_col].resample('ME').mean().dropna()
+        """Return the raw monthly target series and its DatetimeIndex (sentinel-safe)."""
+        monthly = build_monthly_series(df, target_col=self.config.data.target_col,
+                                       start_year=self.config.data.start_year)
         return monthly.values.astype(float), monthly.index
 
     def _monthly_arrays(self, df):
@@ -702,11 +794,21 @@ class Seq2SeqTrainer(CombinedTrainerMixin):
         if not origins:
             raise ValueError("Not enough data to build backtest panels.")
 
+        import pandas as pd
+        train_end = getattr(self, 'train_end_date', None)
+        train_end_ts = pd.Timestamp(train_end) if train_end else None
+
         panels = []
         for origin in origins:
             forecast = self._forecast_from(raw, X_raw, cond_raw, origin,
                                            n_mc=self.config.model.mc_dropout_samples)
             start = max(0, origin - history_months)
+            # A panel is genuinely out-of-sample only if its whole target horizon
+            # lies after the model's training era; anything else is (partly)
+            # in-sample and must be labeled as such.
+            in_sample = (train_end_ts is None
+                         or dates[origin] <= train_end_ts)
+            suffix = "" if not in_sample else "  [IN-SAMPLE]"
             panels.append({
                 'history_dates': dates[start:origin],
                 'history_values': raw[start:origin],
@@ -716,17 +818,24 @@ class Seq2SeqTrainer(CombinedTrainerMixin):
                 'pred_upper': forecast['q90'],
                 'actual': raw[origin:origin + horizon],
                 'origin_date': dates[origin],
-                'label': f"Forecast from {dates[origin].strftime('%Y-%m')}",
+                'in_sample': in_sample,
+                'label': f"Forecast from {dates[origin].strftime('%Y-%m')}{suffix}",
             })
         return panels
 
     def predict_with_uncertainty(self, input_data: np.ndarray, cond=None,
                                 n_mc_samples: int = 30) -> Dict[str, np.ndarray]:
-        """MC-Dropout forecast from a raw input window.
+        """Forecast from a raw input window with uncertainty.
 
         ``input_data`` is a raw window: ``(W,)`` univariate or ``(W, C)`` multivariate.
-        ``cond`` is the raw (unscaled) conditioning scalar or None. Predictions are
-        inverse-transformed back to sunspot numbers via the target scaler (unchanged).
+        ``cond`` is the raw (unscaled) conditioning scalar or None.
+
+        Interval semantics: for quantile-head models, q10/q50/q90 come from the
+        TRAINED quantile head (the pinball-calibrated aleatoric spread), which is
+        what conformal calibration operates on. MC-Dropout samples of the median
+        provide 'mean'/'std'/'samples' as an epistemic diagnostic only. For pure
+        MSE models everything falls back to MC-Dropout statistics. All outputs
+        are inverse-transformed to raw units and clipped at 0.
         """
         if self.model is None:
             raise ValueError("Model not trained. Call train() first.")
@@ -748,38 +857,31 @@ class Seq2SeqTrainer(CombinedTrainerMixin):
             c = self.cond_scaler.transform(np.array([[float(cond)]])).ravel()
             cond_tensor = torch.FloatTensor(c).unsqueeze(0).to(self.device)
 
-        # Generate MC-Dropout predictions
-        mc_predictions = self.model.mc_predict(input_tensor, cond=cond_tensor, n_samples=n_mc_samples)
-        
-        # Convert back to original scale
-        if self.data_scaler is not None:
-            mc_predictions_unscaled = []
-            for i in range(mc_predictions.shape[-1]):
-                pred_unscaled = self.data_scaler.inverse_transform(
-                    mc_predictions[0, :, i].cpu().numpy().reshape(-1, 1)
-                ).ravel()
-                mc_predictions_unscaled.append(pred_unscaled)
-            mc_predictions_unscaled = np.stack(mc_predictions_unscaled, axis=-1)
-        else:
-            mc_predictions_unscaled = mc_predictions[0].cpu().numpy()
-        
-        # Compute statistics
-        mean_pred = np.mean(mc_predictions_unscaled, axis=-1)
-        std_pred = np.std(mc_predictions_unscaled, axis=-1)
-        
-        # Quantiles
-        q10 = np.percentile(mc_predictions_unscaled, 10, axis=-1)
-        q50 = np.percentile(mc_predictions_unscaled, 50, axis=-1)
-        q90 = np.percentile(mc_predictions_unscaled, 90, axis=-1)
-        
-        return {
-            'mean': mean_pred,
-            'std': std_pred,
-            'q10': q10,
-            'q50': q50,
-            'q90': q90,
-            'samples': mc_predictions_unscaled
+        # Deterministic forward pass: the trained quantile band (if any).
+        with torch.no_grad():
+            outputs = self.model(input_tensor, cond=cond_tensor)
+        preds = outputs['quantile'] if 'quantile' in outputs else outputs['predictions']
+        point, q10, q90 = self._split_quantile_outputs(preds)
+        point, = point  # batch of 1
+
+        # MC-Dropout samples of the median/point path (epistemic diagnostic).
+        mc = self.model.mc_predict(input_tensor, cond=cond_tensor, n_samples=n_mc_samples)
+        samples = np.stack([
+            self._inverse_target(mc[0, :, i].cpu().numpy()) for i in range(mc.shape[-1])
+        ], axis=-1)
+
+        result = {
+            'mean': np.mean(samples, axis=-1),
+            'std': np.std(samples, axis=-1),
+            'q50': point,
+            'samples': samples,
         }
+        if q10 is not None:
+            result['q10'], result['q90'] = q10[0], q90[0]
+        else:
+            result['q10'] = np.percentile(samples, 10, axis=-1)
+            result['q90'] = np.percentile(samples, 90, axis=-1)
+        return result
 
 
 if __name__ == "__main__":
