@@ -115,6 +115,75 @@ def hathaway_curve_for_peak(horizon: int, peak: float, t0: float = 0.0) -> np.nd
     return hathaway_curve(horizon, _amplitude_to_a(peak), t0)
 
 
+# --------------------------------------------------------------------------- #
+# Shared causal precursor features (Hathaway + learned models use identical
+# extraction so they stay directly comparable on the leaderboard).
+# --------------------------------------------------------------------------- #
+
+def _cycle_features(history: np.ndarray, minima: np.ndarray, k: int,
+                    smoothed: np.ndarray, extended: bool = False) -> List[float]:
+    """Causal features available at minimum ``k`` (the start of a new cycle).
+
+    Base (4): previous-cycle smoothed peak, previous-cycle length, mean raw
+    activity in the 36 months before the minimum, and the smoothed minimum
+    level. With ``extended`` two further causal features are appended: the
+    slope of the smoothed series over the 24 months into the minimum (Waldmeier
+    rise proxy) and the minimum level relative to the previous peak.
+    """
+    prev_start, start = minima[k - 1], minima[k]
+    prev_amp = float(smoothed[prev_start:start].max())
+    prev_len = float(start - prev_start)
+    tail_mean = float(history[max(0, start - 36):start].mean())
+    min_level = float(smoothed[max(0, start - 12):start + 1].min())
+    feats = [prev_amp, prev_len, tail_mean, min_level]
+    if extended:
+        lo = max(0, start - 24)
+        seg = smoothed[lo:start + 1]
+        tail_slope = float(seg[-1] - seg[0]) / max(1, len(seg) - 1)
+        min_over_prev = float(min_level / prev_amp) if prev_amp > 1e-6 else 0.0
+        feats += [tail_slope, min_over_prev]
+    return feats
+
+
+def precursor_feature_matrix(history: np.ndarray, horizon: int,
+                             extended: bool = False):
+    """Build causal (features -> next-cycle smoothed peak) pairs from history.
+
+    Returns ``(X, y, x_now)`` where ``X`` is ``(n_cycles, F)`` features at each
+    interior minimum, ``y`` is the following cycle's smoothed peak amplitude,
+    and ``x_now`` is the ``(F,)`` feature vector at the forecast origin (the end
+    of ``history``, itself a cycle minimum in the LOCO harness). Returns
+    ``None`` when there are too few completed cycles to regress on - callers
+    should fall back to climatology.
+
+    Uses hindsight ``detect_cycle_minima`` on ``history`` only, which is
+    legitimate: everything in ``history`` is the past relative to the origin.
+    """
+    history = np.asarray(history, dtype=float)
+    smoothed = smooth_13m(history)
+    minima = detect_cycle_minima(history, horizon)
+    if len(minima) < 5:
+        return None
+
+    X, y = [], []
+    for k in range(1, len(minima) - 1):
+        X.append(_cycle_features(history, minima, k, smoothed, extended))
+        end = minima[k + 1]
+        y.append(float(smoothed[minima[k]:end].max()))
+
+    # Features at the forecast origin. The detector often re-finds the origin
+    # itself a few months before the series end, so drop any minimum within 60
+    # months of the end so the "previous" cycle can't degenerate.
+    origin_idx = len(history) - 1
+    past_minima = minima[minima < origin_idx - 60]
+    if len(past_minima) < 1:
+        return None
+    minima_plus_origin = np.append(past_minima, origin_idx)
+    x_now = _cycle_features(history, minima_plus_origin,
+                            len(minima_plus_origin) - 1, smoothed, extended)
+    return np.asarray(X), np.asarray(y), np.asarray(x_now)
+
+
 class HathawayPrecursorForecaster:
     """Ridge-regressed amplitude precursor decoded through the Hathaway shape.
 
@@ -129,33 +198,15 @@ class HathawayPrecursorForecaster:
     def __init__(self, ridge_alpha: float = 5.0):
         self.ridge_alpha = ridge_alpha
 
-    @staticmethod
-    def _cycle_features(history: np.ndarray, minima: np.ndarray, k: int,
-                        smoothed: np.ndarray) -> List[float]:
-        """Features available at minimum k (cycle start), causal within history."""
-        prev_start, start = minima[k - 1], minima[k]
-        prev_amp = float(smoothed[prev_start:start].max())
-        prev_len = float(start - prev_start)
-        tail_mean = float(history[max(0, start - 36):start].mean())
-        min_level = float(smoothed[max(0, start - 12):start + 1].min())
-        return [prev_amp, prev_len, tail_mean, min_level]
-
     def forecast(self, history: np.ndarray, horizon: int = 132) -> Dict[str, np.ndarray]:
         from sklearn.linear_model import Ridge
 
         history = np.asarray(history, dtype=float)
-        smoothed = smooth_13m(history)
-        minima = detect_cycle_minima(history, horizon)
         # Need >= 4 completed cycles to regress on; else fall back to climatology.
-        if len(minima) < 5:
+        built = precursor_feature_matrix(history, horizon, extended=False)
+        if built is None:
             return ClimatologyForecaster().forecast(history, horizon)
-
-        X, y = [], []
-        for k in range(1, len(minima) - 1):
-            X.append(self._cycle_features(history, minima, k, smoothed))
-            end = minima[k + 1]
-            y.append(float(smoothed[minima[k]:end].max()))
-        X, y = np.asarray(X), np.asarray(y)
+        X, y, x_now = built
 
         mu, sd = X.mean(axis=0), np.maximum(X.std(axis=0), 1e-9)
         model = Ridge(alpha=self.ridge_alpha).fit((X - mu) / sd, y)
@@ -169,18 +220,6 @@ class HathawayPrecursorForecaster:
                 residuals.append(y[i] - m.predict(((X[i] - mu) / sd)[None])[0])
         sigma = float(np.std(residuals)) if residuals else float(np.std(y))
 
-        # Features at the forecast origin (= end of history, itself a cycle
-        # minimum in the LOCO harness): the "previous" cycle runs from the last
-        # REAL minimum to the origin. The detector often re-finds the origin
-        # itself a few months before the series end - drop any minimum within
-        # 60 months of the end so the previous cycle can't degenerate.
-        origin_idx = len(history) - 1
-        past_minima = minima[minima < origin_idx - 60]
-        if len(past_minima) < 1:
-            return ClimatologyForecaster().forecast(history, horizon)
-        minima_plus_origin = np.append(past_minima, origin_idx)
-        x_now = np.asarray(self._cycle_features(
-            history, minima_plus_origin, len(minima_plus_origin) - 1, smoothed))
         peak = float(model.predict(((x_now - mu) / sd)[None])[0])
         peak = float(np.clip(peak, 20.0, 400.0))
 
@@ -191,4 +230,7 @@ class HathawayPrecursorForecaster:
         }
 
 
+# The learned precursor deep ensemble (models/precursor_ensemble.py) depends on
+# the helpers above and is appended to this list in solar/models/__init__.py, so
+# it is evaluated on the same LOCO leaderboard as these baselines.
 ALL_BASELINES = [ClimatologyForecaster, PersistenceForecaster, HathawayPrecursorForecaster]

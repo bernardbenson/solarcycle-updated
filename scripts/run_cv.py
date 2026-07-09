@@ -18,6 +18,9 @@ import json
 import sys
 from pathlib import Path
 
+import matplotlib
+matplotlib.use('Agg')  # headless: write PNGs without a display
+import matplotlib.pyplot as plt
 import numpy as np
 
 sys.path.append(str(Path(__file__).parent.parent))
@@ -29,6 +32,71 @@ from solar.eval.loco import loco_origins, run_baseline_loco, run_model_loco
 from solar.eval.metrics import aggregate_metrics, forecast_metrics
 from solar.models.baselines import ALL_BASELINES
 from solar.utils.config import load_config
+from solar.utils.plotting import SolarCyclePlotter
+
+
+def plot_loco_panels(name, records, raw, dates, horizon, out_dir, history_months=264):
+    """Per-fold hindcast panels (history + forecast band + actual) for one model."""
+    panels = []
+    for r in sorted(records, key=lambda r: r['origin']):
+        o = r['origin']
+        fc = r['forecast']
+        lo = max(0, o - history_months)
+        mean = np.asarray(fc.get('q50', fc['mean']))
+        q10 = np.asarray(fc.get('q10', mean))
+        q90 = np.asarray(fc.get('q90', mean))
+        panels.append({
+            'history_dates': dates[lo:o], 'history_values': raw[lo:o],
+            'forecast_dates': dates[o:o + horizon],
+            'pred_mean': mean, 'pred_lower': q10, 'pred_upper': q90,
+            'actual': r['actual'], 'origin_date': dates[o],
+            'label': f"{dates[o].strftime('%Y-%m')}  RMSE {r['metrics']['rmse']:.1f}",
+        })
+    if not panels:
+        return
+    plots_dir = out_dir / 'plots'
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    plotter = SolarCyclePlotter(style='publication')
+    fig = plotter.plot_cycle_backtest(
+        panels, title=f"LOCO backtest: {name}",
+        save_path=plots_dir / 'cycle_backtest.png')
+    plt.close(fig)
+
+
+def plot_leaderboard(rows, out_dir):
+    """Bar charts comparing RMSE and 80% coverage across evaluated models."""
+    ranked = sorted(rows, key=lambda r: r['rmse'])
+    names = [r['name'].split(' (')[0].split('+')[0][:24] for r in ranked]
+    rmse = [r['rmse'] for r in ranked]
+    # Show intrinsic (pre-conformal) coverage - that's where models differ;
+    # conformal calibration lifts everything to ~nominal afterwards.
+    cov = [r.get('coverage_80') for r in ranked]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+    ax1.barh(names, rmse, color='#3a7ca5')
+    ax1.invert_yaxis()
+    ax1.set_xlabel('RMSE (raw SSN)')
+    ax1.set_title('LOCO RMSE (lower is better)', fontweight='bold')
+    for i, v in enumerate(rmse):
+        ax1.text(v, i, f' {v:.1f}', va='center')
+
+    cov_vals = [(c if c is not None else 0.0) for c in cov]
+    ax2.barh(names, cov_vals, color='#f4a261')
+    ax2.invert_yaxis()
+    ax2.axvline(0.80, color='crimson', linestyle='--', label='nominal 0.80')
+    ax2.set_xlabel('80% interval coverage')
+    ax2.set_title('Calibration (closer to 0.80 is better)', fontweight='bold')
+    ax2.legend()
+    for i, c in enumerate(cov):
+        ax2.text(cov_vals[i], i, f" {c:.2f}" if c is not None else ' n/a', va='center')
+
+    plots_dir = out_dir / 'plots'
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    fig.suptitle('LOCO Leaderboard', fontsize=15, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(plots_dir / 'leaderboard.png', dpi=200, bbox_inches='tight',
+                facecolor='white')
+    plt.close(fig)
 
 
 def summarize(name, records):
@@ -126,13 +194,24 @@ def main():
     print(f"LOCO folds ({len(origins)} held-out cycles): "
           + ", ".join(dates[o].strftime('%Y-%m') for o in origins))
 
+    out_dir = Path(args.out or 'data/experiments/cv')
     all_records, rows = {}, []
 
     for cls in ALL_BASELINES:
         baseline = cls()
         records = run_baseline_loco(baseline, raw, origins, horizon)
         all_records[baseline.name] = records
-        rows.append(summarize(baseline.name, records))
+        row = summarize(baseline.name, records)
+        # Baselines with intervals (climatology, precursor_ensemble) also get a
+        # conformal-calibrated coverage column, mirroring the neural-model path.
+        cal, post_cov = conformal_pass(records)
+        if post_cov is not None:
+            row['coverage_80_conformal'] = post_cov
+            base_dir = out_dir / baseline.name
+            base_dir.mkdir(parents=True, exist_ok=True)
+            with open(base_dir / 'conformal.json', 'w') as f:
+                json.dump(cal.to_dict(), f, indent=2)
+        rows.append(row)
 
     if not args.baselines_only:
         for path, config in zip(args.configs, configs):
@@ -159,7 +238,6 @@ def main():
                 rows.append(ens)
 
     # ---------------- leaderboard ----------------
-    out_dir = Path(args.out or 'data/experiments/cv')
     out_dir.mkdir(parents=True, exist_ok=True)
 
     header = (f"{'model':<40}{'folds':>6}{'RMSE':>8}{'MAE':>8}{'RMSEsm':>8}"
@@ -192,6 +270,12 @@ def main():
     }
     with open(out_dir / 'per_fold_metrics.json', 'w') as f:
         json.dump(detail, f, indent=2)
+
+    # ---------------- plots ----------------
+    for name, records in all_records.items():
+        plot_loco_panels(name, records, raw, dates, horizon, out_dir / name)
+    plot_leaderboard(rows, out_dir)
+    print(f"Saved per-model backtest panels + leaderboard.png under {out_dir}")
 
     print(f"\nSaved leaderboard + per-fold metrics to {out_dir}")
 
