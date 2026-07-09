@@ -7,24 +7,30 @@ import numpy as np
 import json
 from typing import Dict, Optional, Tuple, Any
 from pathlib import Path
-from sklearn.preprocessing import StandardScaler, RobustScaler as SklearnRobustScaler
+from sklearn.preprocessing import (
+    StandardScaler, MinMaxScaler, RobustScaler as SklearnRobustScaler,
+)
 
 
 class RobustScaler:
-    """Enhanced robust scaler with configurable transforms and persistence."""
-    
-    def __init__(self, method: str = "robust", transform: str = "identity", 
+    """Enhanced scaler with configurable transforms and persistence.
+
+    All transform parameters (shifts) are frozen at ``fit()``; ``transform()``
+    never mutates state, so forward/inverse stay consistent for any input.
+    """
+
+    def __init__(self, method: str = "robust", transform: str = "identity",
                  quantile_range: Tuple[float, float] = (25.0, 75.0)):
         """
         Args:
-            method: "robust", "standard", or "none"
-            transform: "identity", "log1p", or "sqrt" 
+            method: "robust", "standard", "minmax", or "none"
+            transform: "identity", "log1p", "sqrt", or "asinh"
             quantile_range: IQR range for robust scaling
         """
         self.method = method
         self.transform_type = transform  # Renamed to avoid conflict with transform() method
         self.quantile_range = quantile_range
-        
+
         # Initialize scalers (accept either a plain string or a str-Enum).
         method_str = str(getattr(method, 'value', method)).lower()
 
@@ -32,60 +38,69 @@ class RobustScaler:
             self.scaler = SklearnRobustScaler(quantile_range=quantile_range)
         elif method_str == "standard":
             self.scaler = StandardScaler()
+        elif method_str == "minmax":
+            self.scaler = MinMaxScaler()
         else:
             self.scaler = None
-            
+
         # Transform parameters
         self.transform_params = {}
         self.fitted = False
-    
+
+    def _transform_str(self) -> str:
+        return str(getattr(self.transform_type, 'value', self.transform_type)).lower()
+
+    def _fit_shift(self, data: np.ndarray) -> None:
+        """Compute and freeze the transform shift from the fitting data only."""
+        transform_str = self._transform_str()
+        if transform_str == "log1p":
+            shift = abs(float(np.min(data))) + 1 if np.any(data < 0) else 0.0
+            self.transform_params['log1p_shift'] = shift
+        elif transform_str == "sqrt":
+            shift = abs(float(np.min(data))) if np.any(data < 0) else 0.0
+            self.transform_params['sqrt_shift'] = shift
+
     def _apply_transform(self, data: np.ndarray) -> np.ndarray:
-        """Apply variance-stabilizing transform."""
-        transform_str = str(getattr(self.transform_type, 'value', self.transform_type)).lower()
+        """Apply variance-stabilizing transform using the frozen fit-time shift."""
+        transform_str = self._transform_str()
 
         if transform_str == "log1p":
-            # Ensure positive values for log transform
-            if np.any(data < 0):
-                # Shift to make all values positive
-                shift = abs(np.min(data)) + 1
-                self.transform_params['log1p_shift'] = shift
-                data = data + shift
-            return np.log1p(data)
+            data = data + self.transform_params.get('log1p_shift', 0.0)
+            # Guard unseen values below the fit-time minimum (do NOT refit the shift).
+            return np.log1p(np.clip(data, 0.0, None))
         elif transform_str == "sqrt":
-            # Ensure non-negative values for sqrt
-            if np.any(data < 0):
-                shift = abs(np.min(data))
-                self.transform_params['sqrt_shift'] = shift
-                data = data + shift
-            return np.sqrt(data)
+            data = data + self.transform_params.get('sqrt_shift', 0.0)
+            return np.sqrt(np.clip(data, 0.0, None))
+        elif transform_str == "asinh":
+            return np.arcsinh(data)
         else:  # identity
             return data
-    
+
     def _inverse_transform(self, data: np.ndarray) -> np.ndarray:
         """Inverse variance-stabilizing transform."""
-        transform_str = str(getattr(self.transform_type, 'value', self.transform_type)).lower()
+        transform_str = self._transform_str()
 
         if transform_str == "log1p":
             data = np.expm1(data)
-            if 'log1p_shift' in self.transform_params:
-                data = data - self.transform_params['log1p_shift']
+            data = data - self.transform_params.get('log1p_shift', 0.0)
         elif transform_str == "sqrt":
             data = np.square(data)
-            if 'sqrt_shift' in self.transform_params:
-                data = data - self.transform_params['sqrt_shift']
+            data = data - self.transform_params.get('sqrt_shift', 0.0)
+        elif transform_str == "asinh":
+            data = np.sinh(data)
         return data
-    
+
     def fit(self, data: np.ndarray) -> 'RobustScaler':
-        """Fit the scaler to data."""
+        """Fit the scaler to data (transform shifts are frozen here)."""
         data = data.reshape(-1, 1) if data.ndim == 1 else data
-        
-        # Apply variance-stabilizing transform
+
+        self._fit_shift(data)
         transformed_data = self._apply_transform(data)
-        
+
         # Fit scaler if not "none"
         if self.scaler is not None:
             self.scaler.fit(transformed_data)
-        
+
         self.fitted = True
         return self
     
@@ -145,7 +160,8 @@ class RobustScaler:
             'fitted': self.fitted,
         }
         if self.scaler is not None:
-            for attr in ('center_', 'scale_', 'mean_', 'var_'):
+            for attr in ('center_', 'scale_', 'mean_', 'var_',
+                         'min_', 'data_min_', 'data_max_', 'data_range_'):
                 if hasattr(self.scaler, attr):
                     params[attr] = getattr(self.scaler, attr).tolist()
         return params
@@ -161,7 +177,8 @@ class RobustScaler:
         scaler.transform_params = params['transform_params']
         scaler.fitted = params['fitted']
         if scaler.scaler is not None and params['fitted']:
-            for attr in ('center_', 'scale_', 'mean_', 'var_'):
+            for attr in ('center_', 'scale_', 'mean_', 'var_',
+                         'min_', 'data_min_', 'data_max_', 'data_range_'):
                 if attr in params:
                     setattr(scaler.scaler, attr, np.array(params[attr]))
         return scaler
@@ -274,7 +291,8 @@ def prepare_multivariate_monthly_data(df, target_col: str = 'sunspot_number',
                                       precursor_cols: Optional[list] = None,
                                       geomag_mask: bool = True,
                                       start_year: int = 1818,
-                                      scaler_config: Optional[Dict[str, Any]] = None
+                                      scaler_config: Optional[Dict[str, Any]] = None,
+                                      fit_end_idx: Optional[int] = None
                                       ) -> Tuple[np.ndarray, np.ndarray, MultiChannelScaler, Any]:
     """Build a scaled multivariate monthly input array with precursor channels.
 
@@ -283,20 +301,20 @@ def prepare_multivariate_monthly_data(df, target_col: str = 'sunspot_number',
     (e.g. geomagnetic from 1932) are zero-filled before that, with a binary availability
     mask appended as the last channel. The target (channel-0) scaler is identical to the
     univariate path, so prediction inverse-transform is unchanged.
+
+    ``fit_end_idx``: scalers are fit on rows ``[:fit_end_idx]`` only (the training
+    era) and then applied to the full series - pass the train/validation boundary
+    to avoid normalization leakage. None fits on everything (legacy behaviour).
     """
-    import pandas as pd
+    from ..data.monthly import build_monthly_frame
 
     precursor_cols = precursor_cols or []
     scaler_config = scaler_config or {}
 
-    d = df.copy()
-    d['date'] = pd.to_datetime(d['date'])
-    d = d.set_index('date')
-    d = d[d.index.year >= start_year]
-
-    # Target: monthly mean; -1 sentinels -> NaN; interpolate the few gaps for continuity.
-    target = d[target_col].resample('ME').mean().replace(-1.0, np.nan)
-    target = target.interpolate('linear').bfill().ffill()
+    # Sentinels (-1 missing-day markers) are masked at native resolution inside
+    # build_monthly_frame, BEFORE monthly aggregation.
+    target, precursors = build_monthly_frame(
+        df, target_col=target_col, precursor_cols=precursor_cols, start_year=start_year)
     index = target.index
 
     columns = [target.values.astype(float)]
@@ -309,7 +327,7 @@ def prepare_multivariate_monthly_data(df, target_col: str = 'sunspot_number',
 
     available = np.ones(len(index), dtype=bool)
     for col in precursor_cols:
-        series = d[col].resample('ME').mean().reindex(index)
+        series = precursors[col]
         available &= series.notna().values
         columns.append(series.fillna(0.0).values.astype(float))
         specs.append({'name': col, 'method': 'robust', 'transform': 'log1p',
@@ -321,7 +339,8 @@ def prepare_multivariate_monthly_data(df, target_col: str = 'sunspot_number',
 
     X_raw = np.column_stack(columns)
     scaler = MultiChannelScaler(specs)
-    X_scaled = scaler.fit_transform(X_raw)
+    scaler.fit(X_raw[:fit_end_idx] if fit_end_idx is not None else X_raw)
+    X_scaled = scaler.transform(X_raw)
     return X_scaled, X_raw, scaler, index
 
 

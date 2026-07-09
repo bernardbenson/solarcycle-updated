@@ -113,7 +113,8 @@ def main():
     
     # Load data
     print("\nLoading solar data...")
-    df = load_solar_data()
+    df = load_solar_data(dataset=config.data.dataset,
+                         need_precursors=bool(config.data.precursor_cols))
     print(f"Data shape: {df.shape}")
     print(f"Date range: {df['date'].min()} to {df['date'].max()}")
     

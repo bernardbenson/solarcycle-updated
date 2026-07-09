@@ -1,7 +1,7 @@
 """
 Load the solar time series the trainer consumes.
 
-Prefers a locally cached CSV (produced by ``solar.data.collection``); if none is
+Prefers locally cached CSVs (produced by ``solar.data.collection``); if none is
 present it synthesises a realistic sunspot-like series so the pipeline is runnable
 end-to-end without network access.
 """
@@ -15,14 +15,35 @@ import numpy as np
 import pandas as pd
 
 
-def load_solar_data(data_dir: Union[str, Path] = "data") -> pd.DataFrame:
-    """Return a DataFrame with at least ``date`` and ``sunspot_number`` columns.
+def load_solar_data(data_dir: Union[str, Path] = "data",
+                    dataset: str = "ssn",
+                    need_precursors: bool = False) -> pd.DataFrame:
+    """Return a DataFrame with a ``date`` column plus the dataset's target column.
 
-    Resolution order: raw_multivariate_data.csv, then engineered_multivariate_data.csv,
-    then a synthetic fallback.
+    dataset='ssn' (target ``sunspot_number``): prefers the curated SILSO monthly
+    series (silso_monthly.csv, 1749-present); falls back to the daily
+    raw_multivariate_data.csv (1818-present). Runs that need exogenous precursor
+    channels (``need_precursors=True``) always use the daily multivariate CSV.
+
+    dataset='area' (target ``sunspot_area``): the monthly total sunspot area
+    series (sunspot_area_monthly.csv, 1874-present).
     """
     data_dir = Path(data_dir)
-    for name in ("raw_multivariate_data.csv", "engineered_multivariate_data.csv"):
+
+    if dataset == "area":
+        path = data_dir / "sunspot_area_monthly.csv"
+        if path.exists():
+            print(f"Loading {path}...")
+            return pd.read_csv(path)
+        raise FileNotFoundError(
+            f"{path} not found. Fetch it first: uv run python -m solar.data.collection"
+        )
+
+    candidates = ["raw_multivariate_data.csv", "engineered_multivariate_data.csv"] \
+        if need_precursors else \
+        ["silso_monthly.csv", "raw_multivariate_data.csv", "engineered_multivariate_data.csv"]
+
+    for name in candidates:
         path = data_dir / name
         if path.exists():
             print(f"Loading {path}...")
